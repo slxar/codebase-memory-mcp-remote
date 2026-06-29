@@ -501,6 +501,28 @@ TEST(ui_server_rpc_initialize) {
     PASS();
 }
 
+TEST(ui_server_mcp_initialize) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                       "\"params\":{\"protocolVersion\":\"2025-06-18\","
+                       "\"capabilities\":{},"
+                       "\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "POST /mcp HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    char resp[8192];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"protocolVersion\":\"2025-06-18\""));
+    th_server_stop(&ts);
+    PASS();
+}
+
 TEST(ui_server_oversized_body_rejected) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -713,6 +735,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_cors_localhost_reflected);
     RUN_TEST(ui_server_cors_evil_origin_not_reflected);
     RUN_TEST(ui_server_rpc_initialize);
+    RUN_TEST(ui_server_mcp_initialize);
     RUN_TEST(ui_server_oversized_body_rejected);
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);

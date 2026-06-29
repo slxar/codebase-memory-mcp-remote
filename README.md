@@ -353,6 +353,22 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 
 </details>
 
+### Streamable HTTP MCP Transport
+
+Run the MCP server as one shared localhost process over streamable HTTP on `/mcp`:
+
+```bash
+codebase-memory-mcp --transport=streamable-http --port=9749
+```
+
+Register that shared server in Codex with a URL-based MCP entry:
+
+```bash
+codex mcp add codebase-memory-mcp --url http://127.0.0.1:9749/mcp
+```
+
+Start a new Codex session or restart Codex after changing MCP configuration. This mode is useful when multiple Codex sessions should call the same long-lived `codebase-memory-mcp` process instead of each session spawning its own stdio server.
+
 ## Multi-Agent Support
 
 `install` auto-detects and configures all installed agents:

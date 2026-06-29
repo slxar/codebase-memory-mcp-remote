@@ -1383,8 +1383,9 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* POST /rpc → JSON-RPC dispatch (reuses existing MCP tools) */
-    if (is_post && cbm_http_path_match(req->path, "/rpc")) {
+    /* POST /rpc or /mcp → JSON-RPC dispatch (reuses existing MCP tools) */
+    if (is_post && (cbm_http_path_match(req->path, "/rpc") ||
+                    cbm_http_path_match(req->path, "/mcp"))) {
         handle_rpc(c, req, srv->mcp);
         return;
     }

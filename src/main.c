@@ -8,6 +8,7 @@
  *   --help          Print usage and exit
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
+ *   --transport=streamable-http  Run MCP server over HTTP on /mcp
  *
  * Signal handling: SIGTERM/SIGINT trigger graceful shutdown.
  * Watcher runs in a background thread, polling for git changes.
@@ -26,7 +27,8 @@ enum {
     MAIN_MIN_ARGC = 1,
     MAIN_CLI_ARGC = 2,
     MAIN_FLAG_OFF = 5, /* strlen("--ui=") */
-    MAIN_PORT_OFF = 7, /* strlen("--port=") */
+    MAIN_PORT_OFF = 7,      /* strlen("--port=") */
+    MAIN_TRANSPORT_OFF = 12, /* strlen("--transport=") */
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
@@ -290,6 +292,7 @@ static void print_help(void) {
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
+    printf("  codebase-memory-mcp --transport=streamable-http [--port=N]\n");
     printf("\nUI options:\n");
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
@@ -369,6 +372,16 @@ static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg, bool *ex
     return changed;
 }
 
+static bool wants_streamable_http(int argc, char **argv) {
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--transport=", SLEN("--transport=")) == 0 &&
+            strcmp(argv[i] + MAIN_TRANSPORT_OFF, "streamable-http") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Install platform-specific signal handlers. */
 static void setup_signal_handlers(void) {
 #ifdef _WIN32
@@ -382,6 +395,40 @@ static void setup_signal_handlers(void) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 #endif
+}
+
+static int run_streamable_http_server(int argc, char **argv) {
+    cbm_mem_init(MAIN_RAM_FRACTION);
+    cbm_http_server_set_binary_path(argv[0]);
+    cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
+    cbm_log_info("server.start", "version", CBM_VERSION);
+    cbm_diag_start();
+
+    cbm_ui_config_t ui_cfg;
+    cbm_ui_config_load(&ui_cfg);
+    bool explicit_ui_enable = false;
+    if (parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
+        cbm_ui_config_save(&ui_cfg);
+    }
+
+    setup_signal_handlers();
+    cbm_ui_log_init();
+
+    g_http_server = cbm_http_server_new(ui_cfg.ui_port);
+    if (!g_http_server) {
+        cbm_log_error("server.err", "msg", "failed to create streamable HTTP server");
+        cbm_diag_stop();
+        return SKIP_ONE;
+    }
+
+    cbm_log_info("server.http_mcp", "path", "/mcp");
+    cbm_http_server_run(g_http_server);
+
+    cbm_http_server_free(g_http_server);
+    g_http_server = NULL;
+    atomic_store(&g_shutdown, 1);
+    cbm_diag_stop();
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -399,6 +446,10 @@ int main(int argc, char **argv) {
     int subcmd = handle_subcommand(argc, argv);
     if (subcmd >= 0) {
         return subcmd;
+    }
+
+    if (wants_streamable_http(argc, argv)) {
+        return run_streamable_http_server(argc, argv);
     }
 
     /* parent-death watchdog — distilled from #407 (fixes #406). Start it early so
