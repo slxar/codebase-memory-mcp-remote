@@ -1,0 +1,5 @@
+- [x] Bind and auth tests (RED)
+- [x] Implement bind and auth (GREEN)
+- [x] Artifact upload/import endpoint
+- [x] Publisher helper and README usage
+- [x] Full verification and GitHub push

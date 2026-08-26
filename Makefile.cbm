@@ -482,7 +482,7 @@ $(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUI
 	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
-	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
@@ -561,7 +561,7 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(LDFLAGS_TEST)
 
 test: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
@@ -575,7 +575,7 @@ $(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRC
 		$(LDFLAGS_TEST)
 
 test-repro: $(BUILD_DIR)/test-repro-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-repro-runner
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
 

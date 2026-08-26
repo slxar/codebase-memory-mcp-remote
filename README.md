@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-5719_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-9_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agents-11-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -20,7 +20,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp) — every release binary is signed, checksummed, and scanned by 70+ antivirus engines. All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp) — every release binary is signed, checksummed, and scanned by 70+ antivirus engines. Normal operation is 100% local; the opt-in remote graph mode sends only the artifact you explicitly publish. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -233,7 +233,12 @@ Benchmarked on Apple M3 Pro:
 
 ## Troubleshooting & Diagnostics
 
-codebase-memory-mcp runs **100% locally and collects no telemetry** — your code, queries, environment, and usage never leave your machine. That privacy guarantee also means that when you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no data at all unless you choose to send it.** Here is how to capture it yourself.
+codebase-memory-mcp collects no telemetry. Normal operation runs locally; the
+optional remote graph workflow transfers only artifacts you explicitly publish.
+That privacy boundary also means that when you hit something we can't reproduce
+on our side (a slow memory climb over hours, a performance regression, a leak
+that only appears after days of real use), **we have no data at all unless you
+choose to send it.** Here is how to capture it yourself.
 
 ### Capture a diagnostics log
 
@@ -369,6 +374,41 @@ codex mcp add codebase-memory-mcp --url http://127.0.0.1:9749/mcp
 
 Start a new Codex session or restart Codex after changing MCP configuration. This mode is useful when multiple Codex sessions should call the same long-lived `codebase-memory-mcp` process instead of each session spawning its own stdio server.
 
+#### Shared remote graph
+
+The HTTP transport can serve a shared graph to other machines. Keep the
+loopback default for local use; a non-loopback bind requires a bearer token:
+
+```bash
+CBM_HTTP_TOKEN='replace-with-a-long-random-token' \
+  codebase-memory-mcp --transport=streamable-http --host=0.0.0.0 --port=9749
+```
+
+Put HTTPS in front with a reverse proxy or VPN. On the indexing machine, run
+the normal persistent index, then publish its artifact:
+
+```bash
+codebase-memory-mcp cli index_repository \
+  '{"repo_path":"/path/to/source","persistence":true}'
+CBM_HTTP_TOKEN='replace-with-a-long-random-token' \
+  scripts/publish-artifact.py /path/to/source --url https://cbm.example
+```
+
+For a remote Codex client, pass the token through its bearer-token environment
+option instead of putting it in the URL:
+
+```bash
+codex mcp add shared-codebase-memory \
+  --url https://cbm.example/mcp \
+  --bearer-token-env-var CBM_HTTP_TOKEN
+```
+
+The publisher sends `.codebase-memory/graph.db.zst` to
+`POST /api/artifact/<project>`. The remote server imports it atomically and
+the next MCP request can query the shared graph. Graph-only uploads support
+structural tools; `get_code_snippet` and `search_code` still need the source
+checkout available at the remote machine.
+
 ## Multi-Agent Support
 
 `install` auto-detects and configures all installed agents:
@@ -484,6 +524,8 @@ codebase-memory-mcp config reset auto_index              # reset to default
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
+| `CBM_HTTP_HOST` | `127.0.0.1` | IPv4 address used by the HTTP UI/streamable server. Non-loopback binds require `CBM_HTTP_TOKEN`. |
+| `CBM_HTTP_TOKEN` | *(unset)* | Bearer token required for HTTP requests when set; mandatory for non-loopback binds. |
 | `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Logs go to stderr; stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0–1; set `0` to disable. Invalid values are ignored with a warning. |
