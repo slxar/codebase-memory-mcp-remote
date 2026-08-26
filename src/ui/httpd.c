@@ -3,7 +3,7 @@
  *
  * Original implementation written for this project from RFC 9112 and the
  * needs of our endpoints (see httpd.h for the full design constraints:
- * single-threaded, localhost-only, strict CRLF, Connection: close).
+ * single-threaded, explicit IPv4 binding, strict CRLF, Connection: close).
  */
 #include "ui/httpd.h"
 
@@ -111,7 +111,10 @@ static int send_all(cbm_sock_t fd, const void *data, size_t len) {
 
 /* ── Listener ─────────────────────────────────────────────────── */
 
-cbm_httpd_t *cbm_httpd_listen(int port) {
+cbm_httpd_t *cbm_httpd_listen_on(int port, const char *bind_address) {
+    if (!bind_address || port < 0 || port > 65535)
+        return NULL;
+
 #ifdef _WIN32
     static atomic_int wsa_started = 0;
     int expected = 0;
@@ -135,12 +138,17 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #endif
 
-    /* Loopback only — never any other interface. */
+    struct in_addr bind_addr;
+    if (inet_pton(AF_INET, bind_address, &bind_addr) != 1) {
+        cbm_sock_close(fd);
+        return NULL;
+    }
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
-    addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 */
+    addr.sin_addr = bind_addr;
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 16) != 0) {
         cbm_sock_close(fd);
@@ -164,6 +172,10 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     d->port = (int)ntohs(bound.sin_port);
     d->recv_deadline_ms = CBM_HTTP_RECV_DEADLINE_MS;
     return d;
+}
+
+cbm_httpd_t *cbm_httpd_listen(int port) {
+    return cbm_httpd_listen_on(port, "127.0.0.1");
 }
 
 int cbm_httpd_port(const cbm_httpd_t *d) {
@@ -344,6 +356,16 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
             copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin));
         } else if (header_name_is(p, nlen, "accept-language")) {
             copy_header_value(colon + 1, eol, req->accept_language, sizeof(req->accept_language));
+        } else if (header_name_is(p, nlen, "authorization")) {
+            copy_header_value(colon + 1, eol, req->authorization, sizeof(req->authorization));
+        } else if (header_name_is(p, nlen, "x-cbm-artifact-original-size")) {
+            copy_header_value(colon + 1, eol, req->artifact_original_size,
+                              sizeof(req->artifact_original_size));
+        } else if (header_name_is(p, nlen, "x-cbm-artifact-schema-version")) {
+            copy_header_value(colon + 1, eol, req->artifact_schema_version,
+                              sizeof(req->artifact_schema_version));
+        } else if (header_name_is(p, nlen, "x-cbm-artifact-commit")) {
+            copy_header_value(colon + 1, eol, req->artifact_commit, sizeof(req->artifact_commit));
         } else if (header_name_is(p, nlen, "transfer-encoding")) {
             /* Chunked (or any transfer coding) is not supported. */
             return 411;

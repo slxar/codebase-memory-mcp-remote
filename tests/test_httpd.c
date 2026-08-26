@@ -19,6 +19,8 @@
 #include "../src/ui/http_server.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "pipeline/artifact.h"
+#include "store/store.h"
 #include "ui/httpd.h"
 #include "ui/http_server.h"
 
@@ -119,6 +121,20 @@ static int th_http(int port, const char *request, char *resp, size_t respsz) {
     if (s == TH_SOCK_BAD)
         return 0;
     if (th_send_all(s, request, strlen(request)) != 0) {
+        th_sock_close(s);
+        return 0;
+    }
+    int n = th_recv_until_close(s, resp, respsz);
+    th_sock_close(s);
+    return n;
+}
+
+static int th_http_bytes(int port, const char *head, const void *body, size_t body_len, char *resp,
+                         size_t respsz) {
+    th_sock_t s = th_connect(port);
+    if (s == TH_SOCK_BAD)
+        return 0;
+    if (th_send_all(s, head, strlen(head)) != 0 || th_send_all(s, body, body_len) != 0) {
         th_sock_close(s);
         return 0;
     }
@@ -390,6 +406,12 @@ TEST(httpd_listen_port_collision_returns_null) {
     PASS();
 }
 
+TEST(httpd_rejects_invalid_bind_address) {
+    cbm_httpd_t *d = cbm_httpd_listen_on(0, "not-an-ip");
+    ASSERT_NULL(d);
+    PASS();
+}
+
 /* ── Full UI server integration ───────────────────────────────── */
 
 typedef struct {
@@ -476,6 +498,111 @@ TEST(ui_server_cors_evil_origin_not_reflected) {
     ASSERT_EQ(th_status(resp), 204);
     ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
     th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_requires_token_when_configured) {
+    cbm_http_server_t *srv = cbm_http_server_new_with_options(0, "0.0.0.0", "test-token");
+    ASSERT_NOT_NULL(srv);
+    th_server_t ts = {.srv = srv};
+    ASSERT_EQ(cbm_thread_create(&ts.tid, 0, th_server_thread, ts.srv), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[4096];
+
+    ASSERT_GT(th_http(port, "GET /definitely/not/here HTTP/1.1\r\n\r\n", resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 401);
+
+    ASSERT_GT(th_http(port,
+                      "GET /definitely/not/here HTTP/1.1\r\n"
+                      "Authorization: Bearer wrong\r\n\r\n",
+                      resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 401);
+
+    ASSERT_GT(th_http(port,
+                      "GET /definitely/not/here HTTP/1.1\r\n"
+                      "Authorization: Bearer test-token\r\n\r\n",
+                      resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 404);
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_refuses_remote_bind_without_token) {
+    cbm_http_server_t *srv = cbm_http_server_new_with_options(0, "0.0.0.0", NULL);
+    ASSERT_NULL(srv);
+    PASS();
+}
+
+TEST(ui_server_imports_artifact) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_httpd_artifact_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char repo[512];
+    char db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmpdir);
+    snprintf(db, sizeof(db), "%s/source.db", tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "INSERT INTO projects(name, indexed_at, root_path) "
+                             "VALUES('remote-demo', '2026-01-01', '/tmp/remote-demo');"),
+              0);
+    cbm_store_close(store);
+    ASSERT_EQ(cbm_artifact_export(db, repo, "remote-demo", CBM_ARTIFACT_FAST), 0);
+
+    char zst_path[512];
+    snprintf(zst_path, sizeof(zst_path), "%s/.codebase-memory/graph.db.zst", repo);
+    FILE *zst = fopen(zst_path, "rb");
+    ASSERT_NOT_NULL(zst);
+    ASSERT_EQ(fseek(zst, 0, SEEK_END), 0);
+    long zst_len = ftell(zst);
+    ASSERT_GT(zst_len, 0);
+    ASSERT_EQ(fseek(zst, 0, SEEK_SET), 0);
+    char *zst_data = malloc((size_t)zst_len);
+    ASSERT_NOT_NULL(zst_data);
+    ASSERT_EQ(fread(zst_data, 1, (size_t)zst_len, zst), (size_t)zst_len);
+    fclose(zst);
+
+    struct stat db_stat;
+    ASSERT_EQ(stat(db, &db_stat), 0);
+
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char head[1024];
+    snprintf(head, sizeof(head),
+             "POST /api/artifact/remote-demo HTTP/1.1\r\n"
+             "Content-Length: %ld\r\n"
+             "X-CBM-Artifact-Original-Size: %lld\r\n"
+             "X-CBM-Artifact-Schema-Version: 1\r\n\r\n",
+             zst_len, (long long)db_stat.st_size);
+    char resp[4096];
+    ASSERT_GT(th_http_bytes(cbm_http_server_port(ts.srv), head, zst_data, (size_t)zst_len, resp,
+                             sizeof(resp)),
+              0);
+    ASSERT_EQ(th_status(resp), 201);
+    char imported_db[512];
+    snprintf(imported_db, sizeof(imported_db), "%s/remote-demo.db", cache_dir);
+    ASSERT_TRUE(cbm_file_exists(imported_db));
+
+    th_server_stop(&ts);
+    free(zst_data);
+    if (old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        free(old_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    char cleanup[1024];
+    snprintf(cleanup, sizeof(cleanup), "rm -rf '%s'", tmpdir);
+    (void)system(cleanup);
     PASS();
 }
 
@@ -728,12 +855,16 @@ SUITE(httpd) {
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
     RUN_TEST(httpd_listen_port_collision_returns_null);
+    RUN_TEST(httpd_rejects_invalid_bind_address);
 
     /* Full UI server */
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_root_serves_stub_404);
     RUN_TEST(ui_server_cors_localhost_reflected);
     RUN_TEST(ui_server_cors_evil_origin_not_reflected);
+    RUN_TEST(ui_server_requires_token_when_configured);
+    RUN_TEST(ui_server_refuses_remote_bind_without_token);
+    RUN_TEST(ui_server_imports_artifact);
     RUN_TEST(ui_server_rpc_initialize);
     RUN_TEST(ui_server_mcp_initialize);
     RUN_TEST(ui_server_oversized_body_rejected);

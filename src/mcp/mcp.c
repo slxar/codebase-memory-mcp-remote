@@ -795,6 +795,18 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     srv->current_project = project ? heap_strdup(project) : NULL;
 }
 
+void cbm_mcp_server_invalidate_store(cbm_mcp_server_t *srv) {
+    if (!srv)
+        return;
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+    }
+    srv->store = NULL;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    srv->store_last_used = 0;
+}
+
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
     if (srv) {
         srv->watcher = w;

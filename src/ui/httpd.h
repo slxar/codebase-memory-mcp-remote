@@ -9,7 +9,7 @@
  *     (http_server.c) keeps per-request state in static buffers; a thread
  *     pool would break it. One stalled client can hold the loop for at most
  *     the receive deadline (default 5 s) — acceptable for a localhost tool.
- *   - Binds 127.0.0.1 only (IPv4 loopback). Never any other interface.
+ *   - Binds an explicit IPv4 address. cbm_httpd_listen() remains loopback-only.
  *   - Every response carries explicit Content-Length and "Connection: close";
  *     keep-alive is intentionally NOT implemented (smaller parsing surface;
  *     loopback reconnects are sub-millisecond). Known trade-off: on Windows,
@@ -33,8 +33,8 @@
 
 /* Maximum request head (request line + headers + terminating CRLFCRLF). */
 #define CBM_HTTP_MAX_HEAD (16 * 1024)
-/* Maximum request body accepted via Content-Length. */
-#define CBM_HTTP_MAX_BODY (1024 * 1024)
+/* Maximum request body accepted via Content-Length (RPC and artifact upload). */
+#define CBM_HTTP_MAX_BODY (64 * 1024 * 1024)
 /* Default per-connection receive deadline. */
 #define CBM_HTTP_RECV_DEADLINE_MS 5000
 
@@ -42,14 +42,19 @@ typedef struct cbm_httpd cbm_httpd_t;         /* listener */
 typedef struct cbm_http_conn cbm_http_conn_t; /* accepted connection */
 
 /* A parsed request. `path` and `query` are raw (NOT percent-decoded).
- * `origin` and `accept_language` are the header values consumed by the
- * routing layer ("" when absent). `body` is heap-allocated, NUL-terminated. */
+ * `origin`, `accept_language`, and authentication/artifact headers are the
+ * values consumed by the routing layer ("" when absent). `body` is
+ * heap-allocated, NUL-terminated. */
 typedef struct {
     char method[16];
     char path[2048];
     char query[2048];
     char origin[256];
     char accept_language[256];
+    char authorization[256];
+    char artifact_original_size[64];
+    char artifact_schema_version[32];
+    char artifact_commit[128];
     char *body;
     size_t body_len;
 } cbm_http_req_t;
@@ -59,6 +64,10 @@ typedef struct {
 /* Listen on 127.0.0.1:<port>. port 0 binds an ephemeral port (tests).
  * Returns NULL if the port is unavailable. */
 cbm_httpd_t *cbm_httpd_listen(int port);
+
+/* Listen on an IPv4 literal. Returns NULL for invalid addresses or bind
+ * failures. The caller enforces any policy about which addresses are allowed. */
+cbm_httpd_t *cbm_httpd_listen_on(int port, const char *bind_address);
 
 /* The actually-bound port (differs from the requested one for port 0). */
 int cbm_httpd_port(const cbm_httpd_t *d);

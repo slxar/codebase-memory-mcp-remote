@@ -131,6 +131,10 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv);
  * This prevents resolve_store() from trying to open a .db file when tools specify a project. */
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project);
 
+/* Close a cached project store so a newly imported artifact is visible to
+ * the next query. Safe when no store is cached. */
+void cbm_mcp_server_invalidate_store(cbm_mcp_server_t *srv);
+
 /* ── Cancellation support ─────────────────────────────────────── */
 
 struct cbm_pipeline; /* forward decl */

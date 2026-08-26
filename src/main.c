@@ -8,6 +8,7 @@
  *   --help          Print usage and exit
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
+ *   --host=IPv4     Set HTTP bind address (default 127.0.0.1)
  *   --transport=streamable-http  Run MCP server over HTTP on /mcp
  *
  * Signal handling: SIGTERM/SIGINT trigger graceful shutdown.
@@ -297,6 +298,8 @@ static void print_help(void) {
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("  --host=IPv4  Set HTTP bind address (default 127.0.0.1)\n");
+    printf("  CBM_HTTP_TOKEN authenticates remote HTTP requests\n");
     printf("\nSupported agents (auto-detected):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, Kiro\n");
@@ -382,6 +385,20 @@ static bool wants_streamable_http(int argc, char **argv) {
     return false;
 }
 
+static const char *http_bind_address(int argc, char **argv) {
+    const char *address = getenv("CBM_HTTP_HOST");
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--host=", SLEN("--host=")) == 0)
+            address = argv[i] + SLEN("--host=");
+    }
+    return (address && address[0]) ? address : "127.0.0.1";
+}
+
+static const char *http_bearer_token(void) {
+    const char *token = getenv("CBM_HTTP_TOKEN");
+    return (token && token[0]) ? token : NULL;
+}
+
 /* Install platform-specific signal handlers. */
 static void setup_signal_handlers(void) {
 #ifdef _WIN32
@@ -414,7 +431,8 @@ static int run_streamable_http_server(int argc, char **argv) {
     setup_signal_handlers();
     cbm_ui_log_init();
 
-    g_http_server = cbm_http_server_new(ui_cfg.ui_port);
+    g_http_server = cbm_http_server_new_with_options(ui_cfg.ui_port, http_bind_address(argc, argv),
+                                                      http_bearer_token());
     if (!g_http_server) {
         cbm_log_error("server.err", "msg", "failed to create streamable HTTP server");
         cbm_diag_stop();
@@ -553,7 +571,9 @@ int main(int argc, char **argv) {
     bool http_started = false;
 
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
-        g_http_server = cbm_http_server_new(ui_cfg.ui_port);
+        g_http_server = cbm_http_server_new_with_options(ui_cfg.ui_port,
+                                                          http_bind_address(argc, argv),
+                                                          http_bearer_token());
         if (g_http_server) {
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
                 http_started = true;

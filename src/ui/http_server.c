@@ -10,7 +10,8 @@
  *   GET/POST /api/... → UI support endpoints (layout, index, browse, …)
  *   *                 → 404
  *
- * Runs in a background pthread. Binds to 127.0.0.1 only (see httpd.c).
+ * Runs in a background pthread. Binding defaults to 127.0.0.1; remote binds
+ * are explicit and require bearer-token authentication.
  * Has its own cbm_mcp_server_t with a separate SQLite connection (WAL reader).
  */
 #include "ui/http_server.h"
@@ -20,6 +21,7 @@
 #include "mcp/mcp.h"
 #include "store/store.h"
 #include "cli/cli.h"
+#include "pipeline/artifact.h"
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -32,6 +34,7 @@
 #include <yyjson/yyjson.h>
 
 #include <math.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,8 +54,9 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
-/* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
-#define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
+/* Max JSON-RPC request body size (1 MiB); artifact uploads use the larger
+ * transport cap defined in httpd.h. */
+#define MAX_RPC_BODY_SIZE (1024 * 1024)
 
 /* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
 
@@ -71,15 +75,43 @@ static void update_cors(const cbm_http_req_t *req) {
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Origin: %s\r\n"
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
-                 "Access-Control-Allow-Headers: Content-Type\r\n",
+                 "Access-Control-Allow-Headers: Content-Type, Authorization, "
+                 "X-CBM-Artifact-Original-Size, X-CBM-Artifact-Schema-Version, "
+                 "X-CBM-Artifact-Commit\r\n",
                  req->origin);
     } else {
         /* No Access-Control-Allow-Origin → browser blocks cross-origin access */
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
-                 "Access-Control-Allow-Headers: Content-Type\r\n");
+                 "Access-Control-Allow-Headers: Content-Type, Authorization, "
+                 "X-CBM-Artifact-Original-Size, X-CBM-Artifact-Schema-Version, "
+                 "X-CBM-Artifact-Commit\r\n");
     }
     snprintf(g_cors_json, sizeof(g_cors_json), "%sContent-Type: application/json\r\n", g_cors);
+}
+
+static bool is_loopback_bind(const char *address) {
+    return address && strncmp(address, "127.", 4) == 0;
+}
+
+/* Constant-time comparison prevents the bearer token check from becoming a
+ * byte-by-byte timing oracle. */
+static bool bearer_token_matches(const char *authorization, const char *token) {
+    static const char prefix[] = "Bearer ";
+    if (!authorization || !token || strncmp(authorization, prefix, sizeof(prefix) - 1) != 0)
+        return false;
+
+    const char *provided = authorization + sizeof(prefix) - 1;
+    size_t expected_len = strlen(token);
+    size_t provided_len = strlen(provided);
+    size_t max_len = expected_len > provided_len ? expected_len : provided_len;
+    unsigned char diff = (unsigned char)(expected_len ^ provided_len);
+    for (size_t i = 0; i < max_len; i++) {
+        unsigned char a = i < provided_len ? (unsigned char)provided[i] : 0;
+        unsigned char b = i < expected_len ? (unsigned char)token[i] : 0;
+        diff |= (unsigned char)(a ^ b);
+    }
+    return diff == 0;
 }
 
 static const char *detect_ui_lang(const char *accept_language) {
@@ -117,7 +149,14 @@ struct cbm_http_server {
     atomic_int stop_flag;
     int port;
     bool listener_ok;
+    char bind_address[64];
+    char bearer_token[256];
+    bool require_auth;
 };
+
+static bool request_authorized(const cbm_http_server_t *srv, const cbm_http_req_t *req) {
+    return !srv->require_auth || bearer_token_matches(req->authorization, srv->bearer_token);
+}
 
 /* ── Forward declarations for process-kill PID validation ──────── */
 
@@ -970,6 +1009,136 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                     slot, job->root_path);
 }
 
+static bool parse_unsigned_header(const char *value, size_t *result) {
+    if (!value || !value[0] || !result)
+        return false;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0 || parsed > (unsigned long long)SIZE_MAX)
+        return false;
+    *result = (size_t)parsed;
+    return true;
+}
+
+static bool write_bytes_atomic(const char *path, const void *data, size_t len) {
+    char tmp_path[4096];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.upload_tmp", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path))
+        return false;
+
+    FILE *file = fopen(tmp_path, "wb");
+    if (!file)
+        return false;
+    size_t written = fwrite(data, 1, len, file);
+    int flush_rc = fflush(file);
+    int close_rc = fclose(file);
+    bool ok = written == len && flush_rc == 0 && close_rc == 0;
+    if (!ok) {
+        cbm_unlink(tmp_path);
+        return false;
+    }
+#ifdef _WIN32
+    if (!MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        cbm_unlink(tmp_path);
+        return false;
+    }
+#else
+    if (rename(tmp_path, path) != 0) {
+        cbm_unlink(tmp_path);
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool write_remote_artifact_metadata(const char *path, const char *project,
+                                           const char *commit, size_t original_size,
+                                           size_t compressed_size) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "schema_version", CBM_ARTIFACT_SCHEMA_VERSION);
+    yyjson_mut_obj_add_str(doc, root, "project", project);
+    yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
+    yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
+    if (commit && commit[0])
+        yyjson_mut_obj_add_str(doc, root, "commit", commit);
+
+    size_t json_len = 0;
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, &json_len);
+    yyjson_mut_doc_free(doc);
+    if (!json)
+        return false;
+    bool ok = write_bytes_atomic(path, json, json_len);
+    free(json);
+    return ok;
+}
+
+static void handle_artifact_upload(cbm_http_conn_t *c, const cbm_http_req_t *req,
+                                   cbm_mcp_server_t *mcp) {
+    static const char prefix[] = "/api/artifact/";
+    if (strncmp(req->path, prefix, sizeof(prefix) - 1) != 0) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"not found\"}");
+        return;
+    }
+    const char *project = req->path + sizeof(prefix) - 1;
+    if (!project[0] || strchr(project, '/') || !cbm_validate_project_name(project)) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid project\"}");
+        return;
+    }
+    size_t original_size = 0;
+    size_t schema_version = 0;
+    if (!req->body || req->body_len == 0 ||
+        !parse_unsigned_header(req->artifact_original_size, &original_size) ||
+        !parse_unsigned_header(req->artifact_schema_version, &schema_version) ||
+        schema_version > CBM_ARTIFACT_SCHEMA_VERSION ||
+        original_size > (size_t)(1024ULL * 1024ULL * 1024ULL)) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid artifact metadata\"}");
+        return;
+    }
+
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cache unavailable\"}");
+        return;
+    }
+    char remote_root[4096];
+    char artifact_dir[4096];
+    char zst_path[4096];
+    char metadata_path[4096];
+    char db_path[4096];
+    int n = snprintf(remote_root, sizeof(remote_root), "%s/.remote-artifacts/%s", cache_dir, project);
+    if (n < 0 || (size_t)n >= sizeof(remote_root)) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"path too long\"}");
+        return;
+    }
+    n = snprintf(artifact_dir, sizeof(artifact_dir), "%s/%s", remote_root, CBM_ARTIFACT_DIR);
+    if (n < 0 || (size_t)n >= sizeof(artifact_dir) || !cbm_mkdir_p(artifact_dir, 0750)) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot create artifact cache\"}");
+        return;
+    }
+    snprintf(zst_path, sizeof(zst_path), "%s/%s", artifact_dir, CBM_ARTIFACT_FILENAME);
+    snprintf(metadata_path, sizeof(metadata_path), "%s/%s", artifact_dir, CBM_ARTIFACT_META);
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, project);
+
+    if (!write_bytes_atomic(zst_path, req->body, req->body_len) ||
+        !write_remote_artifact_metadata(metadata_path, project, req->artifact_commit, original_size,
+                                        req->body_len)) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"artifact write failed\"}");
+        return;
+    }
+
+    cbm_mcp_server_invalidate_store(mcp);
+    if (cbm_artifact_import(remote_root, db_path) != 0) {
+        cbm_http_replyf(c, 422, g_cors_json, "{\"error\":\"artifact import failed\"}");
+        return;
+    }
+
+    cbm_http_replyf(c, 201, g_cors_json,
+                    "{\"status\":\"imported\",\"project\":\"%s\",\"bytes\":%zu}",
+                    project, req->body_len);
+}
+
 /* GET /api/index-status — returns status of all index jobs */
 static void handle_index_status(cbm_http_conn_t *c) {
     char buf[2048] = "[";
@@ -1348,7 +1517,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 /* ── Handle JSON-RPC request ──────────────────────────────────── */
 
 static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_server_t *mcp) {
-    if (req->body_len == 0 || req->body_len > MAX_BODY_SIZE || !req->body) {
+    if (req->body_len == 0 || req->body_len > MAX_RPC_BODY_SIZE || !req->body) {
         cbm_http_replyf(c, 400, g_cors_json,
                         "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,"
                         "\"message\":\"invalid request size\"},\"id\":null}");
@@ -1383,6 +1552,13 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
+    if (!request_authorized(srv, req)) {
+        char auth_headers[640];
+        snprintf(auth_headers, sizeof(auth_headers), "WWW-Authenticate: Bearer\r\n%s", g_cors_json);
+        cbm_http_replyf(c, 401, auth_headers, "%s", "{\"error\":\"unauthorized\"}");
+        return;
+    }
+
     /* POST /rpc or /mcp → JSON-RPC dispatch (reuses existing MCP tools) */
     if (is_post && (cbm_http_path_match(req->path, "/rpc") ||
                     cbm_http_path_match(req->path, "/mcp"))) {
@@ -1399,6 +1575,12 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* POST /api/index → start background indexing */
     if (is_post && cbm_http_path_match(req->path, "/api/index")) {
         handle_index_start(c, req);
+        return;
+    }
+
+    /* POST /api/artifact/<project> → authenticated graph artifact import */
+    if (is_post && cbm_http_path_match(req->path, "/api/artifact/*")) {
+        handle_artifact_upload(c, req, srv->mcp);
         return;
     }
 
@@ -1485,12 +1667,27 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
 /* ── Public API ───────────────────────────────────────────────── */
 
-cbm_http_server_t *cbm_http_server_new(int port) {
+cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_address,
+                                                     const char *bearer_token) {
+    const char *address = (bind_address && bind_address[0]) ? bind_address : "127.0.0.1";
+    const char *token = bearer_token ? bearer_token : "";
+    if (strlen(address) >= sizeof(((cbm_http_server_t *)0)->bind_address) ||
+        strlen(token) >= sizeof(((cbm_http_server_t *)0)->bearer_token)) {
+        return NULL;
+    }
+    if (!is_loopback_bind(address) && token[0] == '\0') {
+        cbm_log_error("ui.auth.required", "bind", address, "reason", "non_loopback_requires_token");
+        return NULL;
+    }
+
     cbm_http_server_t *srv = calloc(1, sizeof(*srv));
     if (!srv)
         return NULL;
 
     srv->port = port;
+    snprintf(srv->bind_address, sizeof(srv->bind_address), "%s", address);
+    snprintf(srv->bearer_token, sizeof(srv->bearer_token), "%s", token);
+    srv->require_auth = token[0] != '\0';
     atomic_store(&srv->stop_flag, 0);
 
     /* Create a dedicated MCP server for HTTP (own SQLite connection) */
@@ -1501,8 +1698,7 @@ cbm_http_server_t *cbm_http_server_new(int port) {
         return NULL;
     }
 
-    /* Bind to localhost only (httpd refuses anything else by construction) */
-    srv->listener = cbm_httpd_listen(port);
+    srv->listener = cbm_httpd_listen_on(port, address);
     if (!srv->listener) {
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", port);
@@ -1519,10 +1715,14 @@ cbm_http_server_t *cbm_http_server_new(int port) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", srv->port);
     char url[64];
-    snprintf(url, sizeof(url), "http://127.0.0.1:%d", srv->port);
+    snprintf(url, sizeof(url), "http://%s:%d", srv->bind_address, srv->port);
     cbm_log_info("ui.serving", "url", url, "port", port_str);
 
     return srv;
+}
+
+cbm_http_server_t *cbm_http_server_new(int port) {
+    return cbm_http_server_new_with_options(port, "127.0.0.1", NULL);
 }
 
 void cbm_http_server_free(cbm_http_server_t *srv) {

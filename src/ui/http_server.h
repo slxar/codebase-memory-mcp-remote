@@ -1,7 +1,7 @@
 /*
  * http_server.h — Embedded HTTP server for the graph visualization UI.
  *
- * Binds to 127.0.0.1:<port> only (localhost).
+ * Binds to 127.0.0.1:<port> by default; remote binding is opt-in.
  * Serves embedded frontend assets and proxies /rpc to a dedicated
  * read-only cbm_mcp_server_t instance.
  *
@@ -19,6 +19,11 @@ typedef struct cbm_http_server cbm_http_server_t;
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
  * Returns NULL on failure (e.g. port in use). */
 cbm_http_server_t *cbm_http_server_new(int port);
+
+/* Create a server with an explicit IPv4 bind address and optional bearer
+ * token. Non-loopback addresses require a non-empty token. */
+cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_address,
+                                                     const char *bearer_token);
 
 /* Free the HTTP server (call after thread has been joined). */
 void cbm_http_server_free(cbm_http_server_t *srv);
