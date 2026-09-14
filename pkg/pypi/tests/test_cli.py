@@ -74,7 +74,6 @@ class BinarySelectionTests(unittest.TestCase):
                     _cli._native_args(["uninstall", "--yes"]),
                     ["uninstall", "--yes", "--dir", str(expected)],
                 )
-
         explicit_dir = Path("fixtures") / "explicit-install"
         for platform_name in ("linux", "win32"):
             with self.subTest(
@@ -834,4 +833,3 @@ _cli._publish_runtime_set(
                     (_cli._WINDOWS_BINARY_NAME,),
                     False,
                 )
-

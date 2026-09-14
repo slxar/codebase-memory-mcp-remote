@@ -108,6 +108,7 @@ enum {
 
 static atomic_int g_shutdown = 0;
 static cbm_daemon_runtime_client_t *g_daemon_client = NULL;
+static cbm_http_server_t *g_http_server = NULL;
 
 static uint64_t main_deadline_after(uint32_t timeout_ms);
 
@@ -373,6 +374,9 @@ static void request_shutdown(void) {
 #else
     (void)close(STDIN_FILENO);
 #endif
+    if (g_http_server) {
+        cbm_http_server_stop(g_http_server);
+    }
 }
 
 static void signal_handler(int sig) {
@@ -1125,6 +1129,71 @@ static void setup_signal_handlers(void) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 #endif
+}
+
+/* The streamable HTTP transport is an explicit standalone mode. It is kept
+ * outside daemon role classification so callers can launch a short-lived
+ * authenticated HTTP endpoint for remote MCP clients and transport tests. */
+static bool wants_streamable_http(int argc, char **argv) {
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--transport=", SLEN("--transport=")) == 0 &&
+            strcmp(argv[i] + SLEN("--transport="), "streamable-http") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *http_bind_address(int argc, char **argv) {
+    const char *address = getenv("CBM_HTTP_HOST");
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--host=", SLEN("--host=")) == 0)
+            address = argv[i] + SLEN("--host=");
+    }
+    return (address && address[0]) ? address : "127.0.0.1";
+}
+
+static const char *http_bearer_token(void) {
+    const char *token = getenv("CBM_HTTP_TOKEN");
+    return (token && token[0]) ? token : NULL;
+}
+
+static int run_streamable_http_server(int argc, char **argv) {
+    cbm_profile_init();
+    cbm_log_init_from_env();
+    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+    cbm_http_server_set_binary_path(argv[0]);
+    cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
+    cbm_log_info("server.start", "version", CBM_VERSION);
+    cbm_diag_start();
+
+    cbm_ui_config_t ui_cfg;
+    cbm_ui_config_load(&ui_cfg);
+    int port = ui_cfg.ui_port > 0 ? ui_cfg.ui_port : CBM_UI_DEFAULT_PORT;
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--port=", SLEN("--port=")) == 0) {
+            char *end = NULL;
+            long candidate = strtol(argv[i] + SLEN("--port="), &end, CBM_DECIMAL_BASE);
+            if (end && *end == '\0' && candidate > 0 && candidate < MAIN_MAX_PORT)
+                port = (int)candidate;
+        }
+    }
+    setup_signal_handlers();
+    cbm_ui_log_init();
+    cbm_http_server_t *server = cbm_http_server_new_with_options(
+        port, http_bind_address(argc, argv), http_bearer_token());
+    if (!server) {
+        cbm_log_error("server.err", "msg", "failed to create streamable HTTP server");
+        cbm_diag_stop();
+        return EXIT_FAILURE;
+    }
+    g_http_server = server;
+    cbm_log_info("server.http_mcp", "path", "/mcp");
+    cbm_http_server_run(server);
+    g_http_server = NULL;
+    (void)cbm_http_server_free(server);
+    cbm_diag_stop();
+    return EXIT_SUCCESS;
 }
 
 #ifdef _WIN32
@@ -2438,6 +2507,9 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    if (wants_streamable_http(argc, argv)) {
+        return run_streamable_http_server(argc, argv);
+    }
     cbm_daemon_process_role_t role = cbm_daemon_process_role(argc, argv);
     if (role == CBM_DAEMON_PROCESS_WORKER) {
         /* Before this process writes ANYTHING. A worker's stderr is a file the

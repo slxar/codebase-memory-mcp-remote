@@ -211,6 +211,9 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
  * Returns heap-allocated JSON response string, or NULL for notifications. */
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
 
+/* Shared version allow-list for initialization and HTTP protocol headers. */
+bool cbm_mcp_protocol_version_supported(const char *version);
+
 /* ── Tool handler dispatch (for testing) ──────────────────────── */
 
 /* Handle a tools/call request. Returns MCP tool result JSON. */
@@ -262,6 +265,10 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv);
 /* Set the project name associated with the server's current store (for test setup).
  * This prevents resolve_store() from trying to open a .db file when tools specify a project. */
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project);
+
+/* Close a cached project store so a newly imported artifact is visible to
+ * the next query. Safe when no store is cached. */
+void cbm_mcp_server_invalidate_store(cbm_mcp_server_t *srv);
 
 /* ── Cancellation support ─────────────────────────────────────── */
 

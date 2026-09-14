@@ -21,6 +21,8 @@
 #include "../src/ui/http_server.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "pipeline/artifact.h"
+#include "store/store.h"
 #include "ui/httpd.h"
 #include "ui/http_server.h"
 #include <store/store.h>
@@ -138,6 +140,21 @@ static int th_http_raw(int port, const char *request, char *resp, size_t respsz)
     if (s == TH_SOCK_BAD)
         return 0;
     if (th_send_all(s, request, strlen(request)) != 0) {
+        th_sock_close(s);
+        return 0;
+    }
+    int n = th_recv_until_close(s, resp, respsz);
+    th_sock_close(s);
+    return n;
+}
+
+/* Raw exchange with a binary body, used by artifact upload tests. */
+static int th_http_bytes(int port, const char *head, const void *body, size_t body_len, char *resp,
+                         size_t respsz) {
+    th_sock_t s = th_connect(port);
+    if (s == TH_SOCK_BAD)
+        return 0;
+    if (th_send_all(s, head, strlen(head)) != 0 || th_send_all(s, body, body_len) != 0) {
         th_sock_close(s);
         return 0;
     }
@@ -492,6 +509,12 @@ TEST(httpd_close_refuses_while_connection_owns_listener) {
     cbm_httpd_conn_close(connection);
     th_sock_close(client);
     ASSERT_TRUE(cbm_httpd_close(listener));
+    PASS();
+}
+
+TEST(httpd_rejects_invalid_bind_address) {
+    cbm_httpd_t *d = cbm_httpd_listen_on(0, "not-an-ip");
+    ASSERT_NULL(d);
     PASS();
 }
 
@@ -1044,6 +1067,156 @@ TEST(ui_server_rejects_foreign_and_null_origins) {
     PASS();
 }
 
+TEST(ui_server_requires_token_when_configured) {
+    cbm_http_server_t *srv = cbm_http_server_new_with_options(0, "0.0.0.0", "test-token");
+    ASSERT_NOT_NULL(srv);
+    th_server_t ts = {.srv = srv};
+    ASSERT_EQ(cbm_thread_create(&ts.tid, 0, th_server_thread, ts.srv), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[4096];
+
+    ASSERT_GT(th_http(port, "GET /definitely/not/here HTTP/1.1\r\n\r\n", resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 401);
+
+    ASSERT_GT(th_http(port,
+                      "GET /definitely/not/here HTTP/1.1\r\n"
+                      "Authorization: Bearer wrong\r\n\r\n",
+                      resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 401);
+
+    ASSERT_GT(th_http(port,
+                      "GET /definitely/not/here HTTP/1.1\r\n"
+                      "Authorization: Bearer test-token\r\n\r\n",
+                      resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 404);
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_refuses_remote_bind_without_token) {
+    cbm_http_server_t *srv = cbm_http_server_new_with_options(0, "0.0.0.0", NULL);
+    ASSERT_NULL(srv);
+    PASS();
+}
+
+TEST(ui_server_imports_artifact) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_httpd_artifact_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char repo[512];
+    char db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmpdir);
+    snprintf(db, sizeof(db), "%s/source.db", tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "INSERT INTO projects(name, indexed_at, root_path) "
+                             "VALUES('remote-demo', '2026-01-01', '/tmp/remote-demo');"),
+              0);
+    cbm_store_close(store);
+    ASSERT_EQ(cbm_artifact_export(db, repo, "remote-demo", CBM_ARTIFACT_FAST), 0);
+
+    char zst_path[512];
+    snprintf(zst_path, sizeof(zst_path), "%s/.codebase-memory/graph.db.zst", repo);
+    FILE *zst = fopen(zst_path, "rb");
+    ASSERT_NOT_NULL(zst);
+    ASSERT_EQ(fseek(zst, 0, SEEK_END), 0);
+    long zst_len = ftell(zst);
+    ASSERT_GT(zst_len, 0);
+    ASSERT_EQ(fseek(zst, 0, SEEK_SET), 0);
+    char *zst_data = malloc((size_t)zst_len);
+    ASSERT_NOT_NULL(zst_data);
+    ASSERT_EQ(fread(zst_data, 1, (size_t)zst_len, zst), (size_t)zst_len);
+    fclose(zst);
+
+    struct stat db_stat;
+    ASSERT_EQ(stat(db, &db_stat), 0);
+
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char head[1024];
+    int artifact_port = cbm_http_server_port(ts.srv);
+    snprintf(head, sizeof(head),
+             "POST /api/artifact/remote-demo HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%d\r\n"
+             "Content-Length: %ld\r\n"
+             "X-CBM-Artifact-Original-Size: %lld\r\n"
+             "X-CBM-Artifact-Schema-Version: 1\r\n\r\n",
+             artifact_port, zst_len, (long long)db_stat.st_size);
+    char resp[4096];
+    ASSERT_GT(th_http_bytes(artifact_port, head, zst_data, (size_t)zst_len, resp, sizeof(resp)),
+              0);
+    ASSERT_EQ(th_status(resp), 201);
+    char imported_db[512];
+    snprintf(imported_db, sizeof(imported_db), "%s/remote-demo.db", cache_dir);
+    ASSERT_TRUE(cbm_file_exists(imported_db));
+
+    th_server_stop(&ts);
+    free(zst_data);
+    if (old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        free(old_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    char cleanup[1024];
+    snprintf(cleanup, sizeof(cleanup), "rm -rf '%s'", tmpdir);
+    (void)system(cleanup);
+    PASS();
+}
+
+TEST(ui_server_rpc_initialize) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                       "\"params\":{\"protocolVersion\":\"2024-11-05\","
+                       "\"capabilities\":{},"
+                       "\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    char resp[8192];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_mcp_initialize) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                       "\"params\":{\"protocolVersion\":\"2025-06-18\","
+                       "\"capabilities\":{},"
+                       "\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "POST /mcp HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    char resp[8192];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"protocolVersion\":\"2025-06-18\""));
+    th_server_stop(&ts);
+    PASS();
+}
+
 TEST(ui_server_mutations_require_json_content_type) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -1552,6 +1725,86 @@ TEST(ui_server_slow_request_hits_deadline) {
     ASSERT_EQ(th_status(resp2), 404);
 
     th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rejects_headers_before_reading_body) {
+    th_server_t ts = {.srv = cbm_http_server_new_with_options(0, "127.0.0.1", "test-token")};
+    ASSERT_NOT_NULL(ts.srv);
+    cbm_http_server_set_recv_deadline_ms(ts.srv, 300);
+    ASSERT_EQ(cbm_thread_create(&ts.tid, 0, th_server_thread, ts.srv), 0);
+    char resp[4096];
+    int port = cbm_http_server_port(ts.srv);
+    int n = th_http(port, "POST /api/artifact/test HTTP/1.1\r\n"
+                           "Content-Length: 67108864\r\n\r\n", resp, sizeof(resp));
+    int auth_status = th_status(resp);
+    bool challenge = strstr(resp, "WWW-Authenticate: Bearer") != NULL;
+    int n2 = th_http(port, "POST /mcp HTTP/1.1\r\nAuthorization: Bearer test-token\r\n"
+                            "Content-Length: 1048577\r\n\r\n", resp, sizeof(resp));
+    int size_status = th_status(resp);
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(auth_status, 401);
+    ASSERT_TRUE(challenge);
+    ASSERT_GT(n2, 0);
+    ASSERT_EQ(size_status, 413);
+    PASS();
+}
+
+TEST(ui_server_slow_client_does_not_block_other_clients) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_http_server_set_recv_deadline_ms(ts.srv, 1500);
+    int port = cbm_http_server_port(ts.srv);
+    th_sock_t slow = th_connect(port);
+    ASSERT_TRUE(slow != TH_SOCK_BAD);
+    ASSERT_EQ(th_send_all(slow, "GET /api", 8), 0);
+    cbm_usleep(50000);
+    char resp[4096];
+    uint64_t start = cbm_now_ms();
+    int n = th_http(port, "GET /probe HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+    uint64_t elapsed = cbm_now_ms() - start;
+    th_sock_close(slow);
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_TRUE(elapsed < 1000);
+    PASS();
+}
+
+TEST(ui_server_mcp_transport_contract) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    struct { const char *request; int status; } cases[] = {
+        {"GET /mcp HTTP/1.1\r\nAccept: text/event-stream\r\n\r\n", 405},
+        {"DELETE /mcp HTTP/1.1\r\n\r\n", 405},
+        {"POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: bad\r\nContent-Length: 1\r\n\r\n", 400},
+        {"POST /mcp HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Length: 1\r\n\r\n", 403},
+        {"OPTIONS /mcp HTTP/1.1\r\nOrigin: http://localhost:80@evil.example\r\n\r\n", 403},
+        {"OPTIONS /mcp HTTP/1.1\r\nOrigin: http://localhost:0\r\n\r\n", 403},
+    };
+    bool ok = true;
+    char resp[4096];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int n = th_http(cbm_http_server_port(ts.srv), cases[i].request, resp, sizeof(resp));
+        if (n <= 0 || th_status(resp) != cases[i].status) {
+            fprintf(stderr, "contract case %zu: got %d, expected %d\n", i,
+                    th_status(resp), cases[i].status);
+            ok = false;
+        }
+    }
+    const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+    char req[1024];
+    snprintf(req, sizeof(req), "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\n"
+                               "MCP-Protocol-Version: 2025-06-18\r\n"
+                               "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    int status = th_status(resp);
+    th_server_stop(&ts);
+    ASSERT_TRUE(ok);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(status, 202);
+    ASSERT_NOT_NULL(strstr(resp, "Content-Length: 0\r\n"));
     PASS();
 }
 
@@ -2284,12 +2537,18 @@ SUITE(httpd) {
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
     RUN_TEST(httpd_listen_port_collision_returns_null);
+    RUN_TEST(httpd_rejects_invalid_bind_address);
     RUN_TEST(httpd_close_refuses_while_connection_owns_listener);
 
     /* Full UI server */
     RUN_TEST(ui_server_readiness_proof_is_exact_and_generation_bound);
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
+    RUN_TEST(ui_server_requires_token_when_configured);
+    RUN_TEST(ui_server_refuses_remote_bind_without_token);
+    RUN_TEST(ui_server_imports_artifact);
+    RUN_TEST(ui_server_rpc_initialize);
+    RUN_TEST(ui_server_mcp_initialize);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
@@ -2315,6 +2574,9 @@ SUITE(httpd) {
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);
+    RUN_TEST(ui_server_rejects_headers_before_reading_body);
+    RUN_TEST(ui_server_slow_client_does_not_block_other_clients);
+    RUN_TEST(ui_server_mcp_transport_contract);
     RUN_TEST(ui_server_access_log_redacts_query);
     RUN_TEST(ui_server_stop_joins_cleanly);
     RUN_TEST(ui_server_free_refuses_active_loop);

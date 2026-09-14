@@ -1263,6 +1263,14 @@ static const char *SUPPORTED_PROTOCOL_VERSIONS[] = {
 static const int SUPPORTED_VERSION_COUNT =
     (int)(sizeof(SUPPORTED_PROTOCOL_VERSIONS) / sizeof(SUPPORTED_PROTOCOL_VERSIONS[0]));
 
+bool cbm_mcp_protocol_version_supported(const char *version) {
+    if (!version || !version[0]) return false;
+    for (int i = 0; i < SUPPORTED_VERSION_COUNT; i++) {
+        if (strcmp(version, SUPPORTED_PROTOCOL_VERSIONS[i]) == 0) return true;
+    }
+    return false;
+}
+
 static const char MCP_SERVER_INSTRUCTIONS[] =
     "Use graph tools first for structural code discovery: search_graph to find symbols, "
     "trace_path for callers and callees, get_code_snippet for exact source, query_graph for "
@@ -7650,6 +7658,10 @@ static void invalidate_cached_store(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     srv->current_project = NULL;
+}
+
+void cbm_mcp_server_invalidate_store(cbm_mcp_server_t *srv) {
+    invalidate_cached_store(srv);
 }
 
 /* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>

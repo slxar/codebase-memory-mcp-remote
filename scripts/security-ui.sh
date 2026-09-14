@@ -147,9 +147,10 @@ for f in "$HTTPD" "$HTTP_SERVER"; do
 done
 
 if [[ -f "$HTTPD" ]]; then
-    # Must bind to 127.0.0.1 only
+    # The compatibility wrapper must retain the loopback-safe default. Remote
+    # binding is an explicit option guarded by bearer-token enforcement.
     if grep -q '127\.0\.0\.1' "$HTTPD"; then
-        echo "OK: Server binds to 127.0.0.1"
+        echo "OK: Server retains 127.0.0.1 default"
     else
         echo "BLOCKED: No 127.0.0.1 binding found in httpd.c"
         FAIL=1
@@ -161,6 +162,14 @@ if [[ -f "$HTTPD" ]]; then
         FAIL=1
     else
         echo "OK: No 0.0.0.0/INADDR_ANY binding"
+    fi
+
+    if grep -q 'non_loopback_requires_token' "$HTTP_SERVER" &&
+       grep -q 'Bearer ' "$HTTP_SERVER" && grep -qi 'authorization' "$HTTPD"; then
+        echo "OK: Remote binding requires bearer-token authentication"
+    else
+        echo "BLOCKED: Remote binding authentication guard missing"
+        FAIL=1
     fi
 fi
 
