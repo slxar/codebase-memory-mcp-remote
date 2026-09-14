@@ -2,7 +2,7 @@
  * artifact.c — Persistent artifact export/import for team sharing.
  *
  * Export: strip indexes → VACUUM INTO temp → zstd compress → write .zst + metadata
- * Import: decompress → write to cache → open (auto-creates indexes) → integrity check
+ * Import: decompress → validate staged graph → recreate indexes → promote to cache
  */
 #include "foundation/constants.h"
 
@@ -29,6 +29,7 @@ enum {
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,50 +237,49 @@ static void iso_timestamp(char *buf, size_t bufsz) {
 
 /* ── Metadata read/write ─────────────────────────────────────────── */
 
-/* Read schema_version from artifact.json. Returns -1 if missing/invalid. */
-static int read_metadata_version(const char *repo_path) {
+static yyjson_doc *read_metadata(const char *repo_path) {
     char meta_path[CBM_SZ_4K];
-    artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
+    if (!artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META)) {
+        return NULL;
+    }
 
     size_t len = 0;
     char *json = read_file_alloc(meta_path, &len);
     if (!json) {
-        return CBM_NOT_FOUND;
+        return NULL;
     }
 
     yyjson_doc *doc = yyjson_read(json, len, 0);
     free(json);
+    return doc;
+}
+
+/* Read schema_version from artifact.json. Returns -1 if missing/invalid. */
+static int read_metadata_version(const char *repo_path) {
+    yyjson_doc *doc = read_metadata(repo_path);
     if (!doc) {
         return CBM_NOT_FOUND;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *ver = yyjson_obj_get(root, "schema_version");
-    int version = ver ? yyjson_get_int(ver) : CBM_NOT_FOUND;
+    int version = yyjson_is_uint(ver) && yyjson_get_uint(ver) <= INT_MAX
+                      ? (int)yyjson_get_uint(ver) : CBM_NOT_FOUND;
     yyjson_doc_free(doc);
     return version;
 }
 
 /* Read original_size from artifact.json. Returns 0 on error. */
 static size_t read_metadata_original_size(const char *repo_path) {
-    char meta_path[CBM_SZ_4K];
-    artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
-
-    size_t len = 0;
-    char *json = read_file_alloc(meta_path, &len);
-    if (!json) {
-        return 0;
-    }
-
-    yyjson_doc *doc = yyjson_read(json, len, 0);
-    free(json);
+    yyjson_doc *doc = read_metadata(repo_path);
     if (!doc) {
         return 0;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *val = yyjson_obj_get(root, "original_size");
-    size_t result = val ? (size_t)yyjson_get_uint(val) : 0;
+    size_t result = yyjson_is_uint(val) && yyjson_get_uint(val) <= INT_MAX
+                        ? (size_t)yyjson_get_uint(val) : 0;
     yyjson_doc_free(doc);
     return result;
 }
@@ -539,6 +539,80 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
 /* ── Import ──────────────────────────────────────────────────────── */
 
+/* Validate the uploaded database before store open can create missing tables.
+ * User indexes and optional FTS tables may be absent in a stripped artifact. */
+static bool validate_import_db(const char *path, const char *repo_path) {
+    yyjson_doc *meta = read_metadata(repo_path);
+    if (!meta) {
+        return false;
+    }
+    yyjson_val *val = yyjson_obj_get(yyjson_doc_get_root(meta), "project");
+    const char *project = yyjson_get_str(val);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    bool ok = false;
+    if (!project || !project[0] || strlen(project) != yyjson_get_len(val) ||
+        sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        goto done;
+    }
+
+    const char *project_sql =
+        "SELECT name FROM projects WHERE (SELECT count(*) FROM projects) = 1 AND "
+        "(SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN "
+        "('projects', 'nodes', 'edges', 'file_hashes', 'project_summaries')) = 5;";
+    if (sqlite3_prepare_v2(db, project_sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_type(stmt, 0) != SQLITE_TEXT ||
+        sqlite3_column_bytes(stmt, 0) != (int)strlen(project) ||
+        strcmp((const char *)sqlite3_column_text(stmt, 0), project) != 0 ||
+        sqlite3_step(stmt) != SQLITE_DONE) {
+        goto done;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    const char *checks[] = {
+        /* Preparing this verifies all required columns without scanning rows. */
+        "SELECT p.name, p.indexed_at, p.root_path, "
+        "n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+        "n.start_line, n.end_line, n.properties, "
+        "e.id, e.project, e.source_id, e.target_id, e.type, e.properties, e.url_path_gen, "
+        "f.project, f.rel_path, f.sha256, f.mtime_ns, f.size, "
+        "s.project, s.summary, s.source_hash, s.created_at, s.updated_at "
+        "FROM projects p, nodes n, edges e, file_hashes f, project_summaries s LIMIT 0;",
+        "PRAGMA foreign_key_check;",
+        "SELECT 1 FROM nodes WHERE project IS NOT ?1 UNION ALL "
+        "SELECT 1 FROM edges WHERE project IS NOT ?1 UNION ALL "
+        "SELECT 1 FROM file_hashes WHERE project IS NOT ?1 UNION ALL "
+        "SELECT 1 FROM project_summaries WHERE project IS NOT ?1 LIMIT 1;",
+    };
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        if (sqlite3_prepare_v2(db, checks[i], -1, &stmt, NULL) != SQLITE_OK) {
+            goto done;
+        }
+        if (sqlite3_bind_parameter_count(stmt) &&
+            sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK) {
+            goto done;
+        }
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            goto done;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
+
+    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_TEXT &&
+        strcmp((const char *)sqlite3_column_text(stmt, 0), "ok") == 0 &&
+        sqlite3_step(stmt) == SQLITE_DONE) {
+        ok = true;
+    }
+done:
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    yyjson_doc_free(meta);
+    return ok;
+}
+
 int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     if (!repo_path || !cache_db_path) {
         return CBM_NOT_FOUND;
@@ -546,7 +620,7 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     /* Check schema version compatibility */
     int version = read_metadata_version(repo_path);
-    if (version < 0 || version > CBM_ARTIFACT_SCHEMA_VERSION) {
+    if (version < 1 || version > CBM_ARTIFACT_SCHEMA_VERSION) {
         cbm_log_info("artifact.import", "skip", "schema_version_mismatch", "artifact_ver",
                      itoa_buf(version), "current_ver", itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION));
         return CBM_NOT_FOUND;
@@ -569,6 +643,10 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         cbm_log_error("artifact.import", "err", "read_artifact");
         return CBM_NOT_FOUND;
     }
+    if (clen > INT_MAX) {
+        free(compressed);
+        return CBM_NOT_FOUND;
+    }
 
     /* Decompress */
     char *decompressed = malloc(original_size);
@@ -580,7 +658,7 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     int dlen = cbm_zstd_decompress(compressed, (int)clen, decompressed, (int)original_size);
     free(compressed);
 
-    if (dlen <= 0) {
+    if (dlen <= 0 || (size_t)dlen != original_size) {
         free(decompressed);
         cbm_log_error("artifact.import", "err", "zstd_decompress");
         return CBM_NOT_FOUND;
@@ -588,7 +666,11 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     /* Write to temp file, then rename for atomicity */
     char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.import_tmp", cache_db_path);
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.import_tmp", cache_db_path);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        free(decompressed);
+        return CBM_NOT_FOUND;
+    }
 
     /* Ensure cache directory exists */
     char cache_dir[CBM_SZ_1K];
@@ -614,7 +696,13 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         return CBM_NOT_FOUND;
     }
 
-    /* Open with cbm_store_open_path to auto-create missing indexes + FTS5 */
+    if (!validate_import_db(tmp_path, repo_path)) {
+        cbm_log_error("artifact.import", "err", "invalid_graph_artifact");
+        cbm_unlink(tmp_path);
+        return CBM_NOT_FOUND;
+    }
+
+    /* Only a validated graph may have its stripped indexes + FTS5 recreated. */
     cbm_store_t *store = cbm_store_open_path(tmp_path);
     if (!store) {
         cbm_log_error("artifact.import", "err", "open_imported_db");
@@ -670,7 +758,7 @@ bool cbm_artifact_exists(const char *repo_path) {
 
     /* Check schema version is compatible */
     int version = read_metadata_version(repo_path);
-    return version >= 0 && version <= CBM_ARTIFACT_SCHEMA_VERSION;
+    return version >= 1 && version <= CBM_ARTIFACT_SCHEMA_VERSION;
 }
 
 /* ── Commit hash extraction ──────────────────────────────────────── */

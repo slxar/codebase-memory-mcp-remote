@@ -409,6 +409,23 @@ the next MCP request can query the shared graph. Graph-only uploads support
 structural tools; `get_code_snippet` and `search_code` still need the source
 checkout available at the remote machine.
 
+Uploads are validated before replacing an existing graph. The publisher's
+`--project` must match the artifact's project; set `name` when indexing to
+choose a different name. Bad uploads preserve the previous query database.
+
+HTTP uses four workers for socket I/O and serializes graph operations. Request
+reads and response writes each have a five-second deadline. Artifact bodies
+are capped at 64 MiB; other bodies at 1 MiB. Four stalled peers can still occupy
+the worker pool until those deadlines expire.
+
+Browser requests accept HTTP(S) localhost origins by default. For a remote
+browser client, set `CBM_HTTP_ALLOWED_ORIGINS=https://cbm.example` on the server
+(comma-separated exact origins are supported). Native MCP clients that omit
+`Origin` do not need this setting. `/mcp` uses JSON responses and returns 405
+for GET because it does not offer an SSE stream.
+
+Run `make -f Makefile.cbm test-remote` for isolated transport and artifact checks.
+
 ## Multi-Agent Support
 
 `install` auto-detects and configures all installed agents:

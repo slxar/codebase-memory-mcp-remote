@@ -21,7 +21,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path, help="repository containing .codebase-memory")
     parser.add_argument("--url", required=True, help="remote server base URL, e.g. https://cbm.example")
-    parser.add_argument("--project", help="project name (defaults to artifact.json project)")
+    parser.add_argument("--project", help="project name (must match artifact.json project)")
     args = parser.parse_args()
 
     artifact_dir = args.repo / ".codebase-memory"
@@ -37,9 +37,15 @@ def main() -> int:
         print(f"error: invalid artifact.json: {exc}", file=sys.stderr)
         return 2
 
-    project = args.project or metadata.get("project", "")
+    if not isinstance(metadata, dict):
+        print("error: artifact.json must be a JSON object", file=sys.stderr)
+        return 2
+    project = metadata.get("project", "")
     if (not isinstance(project, str) or ".." in project or not PROJECT_RE.fullmatch(project)):
-        print("error: project must be a safe name using letters, numbers, '.', '_' or '-'")
+        print("error: project must be a safe name using letters, numbers, '.', '_' or '-'", file=sys.stderr)
+        return 2
+    if args.project is not None and args.project != project:
+        print("error: --project must match artifact.json project; reindex with the desired name", file=sys.stderr)
         return 2
     schema_version = metadata.get("schema_version")
     original_size = metadata.get("original_size")

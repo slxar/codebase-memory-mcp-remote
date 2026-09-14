@@ -107,6 +107,9 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
  * Returns heap-allocated JSON response string, or NULL for notifications. */
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
 
+/* Shared version allow-list for initialization and HTTP protocol headers. */
+bool cbm_mcp_protocol_version_supported(const char *version);
+
 /* ── Tool handler dispatch (for testing) ──────────────────────── */
 
 /* Handle a tools/call request. Returns MCP tool result JSON. */

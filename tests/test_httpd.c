@@ -495,7 +495,7 @@ TEST(ui_server_cors_evil_origin_not_reflected) {
                     "Origin: http://evil.example.com\r\n\r\n",
                     resp, sizeof(resp));
     ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 204);
+    ASSERT_EQ(th_status(resp), 403);
     ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
     th_server_stop(&ts);
     PASS();
@@ -794,6 +794,86 @@ TEST(ui_server_slow_request_hits_deadline) {
     PASS();
 }
 
+TEST(ui_server_rejects_headers_before_reading_body) {
+    th_server_t ts = {.srv = cbm_http_server_new_with_options(0, "127.0.0.1", "test-token")};
+    ASSERT_NOT_NULL(ts.srv);
+    cbm_http_server_set_recv_deadline_ms(ts.srv, 300);
+    ASSERT_EQ(cbm_thread_create(&ts.tid, 0, th_server_thread, ts.srv), 0);
+    char resp[4096];
+    int port = cbm_http_server_port(ts.srv);
+    int n = th_http(port, "POST /api/artifact/test HTTP/1.1\r\n"
+                           "Content-Length: 67108864\r\n\r\n", resp, sizeof(resp));
+    int auth_status = th_status(resp);
+    bool challenge = strstr(resp, "WWW-Authenticate: Bearer") != NULL;
+    int n2 = th_http(port, "POST /mcp HTTP/1.1\r\nAuthorization: Bearer test-token\r\n"
+                            "Content-Length: 1048577\r\n\r\n", resp, sizeof(resp));
+    int size_status = th_status(resp);
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(auth_status, 401);
+    ASSERT_TRUE(challenge);
+    ASSERT_GT(n2, 0);
+    ASSERT_EQ(size_status, 413);
+    PASS();
+}
+
+TEST(ui_server_slow_client_does_not_block_other_clients) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    cbm_http_server_set_recv_deadline_ms(ts.srv, 1500);
+    int port = cbm_http_server_port(ts.srv);
+    th_sock_t slow = th_connect(port);
+    ASSERT_TRUE(slow != TH_SOCK_BAD);
+    ASSERT_EQ(th_send_all(slow, "GET /api", 8), 0);
+    cbm_usleep(50000);
+    char resp[4096];
+    uint64_t start = cbm_now_ms();
+    int n = th_http(port, "GET /probe HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+    uint64_t elapsed = cbm_now_ms() - start;
+    th_sock_close(slow);
+    th_server_stop(&ts);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_TRUE(elapsed < 1000);
+    PASS();
+}
+
+TEST(ui_server_mcp_transport_contract) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    struct { const char *request; int status; } cases[] = {
+        {"GET /mcp HTTP/1.1\r\nAccept: text/event-stream\r\n\r\n", 405},
+        {"DELETE /mcp HTTP/1.1\r\n\r\n", 405},
+        {"POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: bad\r\nContent-Length: 1\r\n\r\n", 400},
+        {"POST /mcp HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Length: 1\r\n\r\n", 403},
+        {"OPTIONS /mcp HTTP/1.1\r\nOrigin: http://localhost:80@evil.example\r\n\r\n", 403},
+        {"OPTIONS /mcp HTTP/1.1\r\nOrigin: http://localhost:0\r\n\r\n", 403},
+    };
+    bool ok = true;
+    char resp[4096];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int n = th_http(cbm_http_server_port(ts.srv), cases[i].request, resp, sizeof(resp));
+        if (n <= 0 || th_status(resp) != cases[i].status) {
+            fprintf(stderr, "contract case %zu: got %d, expected %d\n", i,
+                    th_status(resp), cases[i].status);
+            ok = false;
+        }
+    }
+    const char *body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+    char req[1024];
+    snprintf(req, sizeof(req), "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\n"
+                               "MCP-Protocol-Version: 2025-06-18\r\n"
+                               "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    int status = th_status(resp);
+    th_server_stop(&ts);
+    ASSERT_TRUE(ok);
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(status, 202);
+    ASSERT_NOT_NULL(strstr(resp, "Content-Length: 0\r\n"));
+    PASS();
+}
+
 TEST(ui_server_access_log_redacts_query) {
     httpd_log_buf[0] = '\0';
     CBMLogLevel prev_level = cbm_log_get_level();
@@ -874,6 +954,9 @@ SUITE(httpd) {
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);
+    RUN_TEST(ui_server_rejects_headers_before_reading_body);
+    RUN_TEST(ui_server_slow_client_does_not_block_other_clients);
+    RUN_TEST(ui_server_mcp_transport_contract);
     RUN_TEST(ui_server_access_log_redacts_query);
     RUN_TEST(ui_server_stop_joins_cleanly);
 }

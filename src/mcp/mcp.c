@@ -613,6 +613,14 @@ static const char *SUPPORTED_PROTOCOL_VERSIONS[] = {
 static const int SUPPORTED_VERSION_COUNT =
     (int)(sizeof(SUPPORTED_PROTOCOL_VERSIONS) / sizeof(SUPPORTED_PROTOCOL_VERSIONS[0]));
 
+bool cbm_mcp_protocol_version_supported(const char *version) {
+    for (int i = 0; version && i < SUPPORTED_VERSION_COUNT; i++) {
+        if (strcmp(version, SUPPORTED_PROTOCOL_VERSIONS[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
 char *cbm_mcp_initialize_response(const char *params_json) {
     /* Determine protocol version: if client requests a version we support,
      * echo it back; otherwise respond with our latest. */

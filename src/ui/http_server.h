@@ -31,8 +31,8 @@ void cbm_http_server_free(cbm_http_server_t *srv);
 /* Signal the HTTP server to stop (safe to call from any thread). */
 void cbm_http_server_stop(cbm_http_server_t *srv);
 
-/* Run the HTTP server event loop (call from background thread).
- * Blocks until cbm_http_server_stop() is called. */
+/* Run four bounded I/O workers with serialized graph dispatch. Blocks until
+ * stop is requested and all worker threads have joined. */
 void cbm_http_server_run(cbm_http_server_t *srv);
 
 /* Check if the server started successfully (listener bound). */
@@ -43,6 +43,7 @@ int cbm_http_server_port(const cbm_http_server_t *srv);
 
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
+void cbm_http_server_set_send_deadline_ms(cbm_http_server_t *srv, int ms);
 
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);

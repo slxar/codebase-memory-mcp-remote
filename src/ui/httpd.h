@@ -2,13 +2,12 @@
  * httpd.h — First-party HTTP/1.1 server transport for the graph UI.
  *
  * Original implementation written for this project from RFC 9112 and the
- * needs of the graph-UI endpoints. Localhost-only by construction.
+ * needs of the graph-UI endpoints and authenticated remote MCP.
  *
  * Design constraints (deliberate — do not "improve" without reading this):
- *   - SINGLE-THREADED, sequential request handling. The routing layer
- *     (http_server.c) keeps per-request state in static buffers; a thread
- *     pool would break it. One stalled client can hold the loop for at most
- *     the receive deadline (default 5 s) — acceptable for a localhost tool.
+ *   - Socket I/O may run concurrently; each connection has one owner. The
+ *     routing layer serializes graph operations and defers replies until
+ *     after unlocking, so a stalled peer cannot hold the graph lock.
  *   - Binds an explicit IPv4 address. cbm_httpd_listen() remains loopback-only.
  *   - Every response carries explicit Content-Length and "Connection: close";
  *     keep-alive is intentionally NOT implemented (smaller parsing surface;
@@ -37,6 +36,7 @@
 #define CBM_HTTP_MAX_BODY (64 * 1024 * 1024)
 /* Default per-connection receive deadline. */
 #define CBM_HTTP_RECV_DEADLINE_MS 5000
+#define CBM_HTTP_SEND_DEADLINE_MS 5000
 
 typedef struct cbm_httpd cbm_httpd_t;         /* listener */
 typedef struct cbm_http_conn cbm_http_conn_t; /* accepted connection */
@@ -52,6 +52,7 @@ typedef struct {
     char origin[256];
     char accept_language[256];
     char authorization[256];
+    char protocol_version[32];
     char artifact_original_size[64];
     char artifact_schema_version[32];
     char artifact_commit[128];
@@ -74,6 +75,7 @@ int cbm_httpd_port(const cbm_httpd_t *d);
 
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms);
+void cbm_httpd_set_send_deadline_ms(cbm_httpd_t *d, int ms);
 
 void cbm_httpd_close(cbm_httpd_t *d);
 
@@ -89,7 +91,18 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms);
  * connection-level error where no response is possible. */
 int cbm_httpd_read_request(cbm_http_conn_t *c, cbm_http_req_t *req);
 
+/* Validate parsed headers before allocating or receiving the body. The check
+ * returns zero to continue, or an HTTP error status to reject the request. */
+typedef int (*cbm_http_head_check_fn)(const cbm_http_req_t *req, size_t content_length, void *ctx);
+int cbm_httpd_read_request_checked(cbm_http_conn_t *c, cbm_http_req_t *req,
+                                  cbm_http_head_check_fn check, void *ctx);
+
 void cbm_http_req_free(cbm_http_req_t *req);
+
+/* Copy replies into the connection until flush, so dispatch can release its
+ * graph lock before socket writes. The connection owns and frees the copy. */
+void cbm_http_conn_defer_response(cbm_http_conn_t *c);
+void cbm_httpd_flush_response(cbm_http_conn_t *c);
 
 /* Send a response. extra_headers is a string of zero or more complete
  * "Name: value\r\n" lines (may be ""). Content-Length and

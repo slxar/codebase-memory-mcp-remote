@@ -471,7 +471,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-remote test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -562,6 +562,11 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 
 test: $(BUILD_DIR)/test-runner
 	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner
+
+test-remote: $(BUILD_DIR)/test-runner $(BUILD_DIR)/codebase-memory-mcp
+	$(BUILD_DIR)/test-runner httpd artifact
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_publish_artifact.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_http_transport.py $(BUILD_DIR)/codebase-memory-mcp
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)

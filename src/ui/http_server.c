@@ -60,22 +60,17 @@
 
 /* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
 
-/* Per-request CORS header buffers. Updated at the start of each dispatch.
- * The server handles requests sequentially on one thread (see httpd.h),
- * which makes these statics safe. */
-static char g_cors[256];      /* CORS headers only */
-static char g_cors_json[512]; /* CORS + Content-Type: application/json */
+/* Dispatch is serialized; these buffers are copied before releasing its lock. */
+static _Thread_local char g_cors[768];
+static _Thread_local char g_cors_json[832];
 
-/* Inspect the Origin header and only reflect it if it's a localhost URL.
- * This prevents remote websites from making cross-origin requests to the
- * local graph-ui server (the key defense against CORS-based data exfil). */
+/* The header policy has already rejected disallowed origins. */
 static void update_cors(const cbm_http_req_t *req) {
-    if (req->origin[0] != '\0' && (cbm_http_path_match(req->origin, "http://localhost:*") ||
-                                   cbm_http_path_match(req->origin, "http://127.0.0.1:*"))) {
+    if (req->origin[0] != '\0') {
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Origin: %s\r\n"
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
-                 "Access-Control-Allow-Headers: Content-Type, Authorization, "
+                 "Access-Control-Allow-Headers: Content-Type, Authorization, MCP-Protocol-Version, "
                  "X-CBM-Artifact-Original-Size, X-CBM-Artifact-Schema-Version, "
                  "X-CBM-Artifact-Commit\r\n",
                  req->origin);
@@ -83,7 +78,7 @@ static void update_cors(const cbm_http_req_t *req) {
         /* No Access-Control-Allow-Origin → browser blocks cross-origin access */
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
-                 "Access-Control-Allow-Headers: Content-Type, Authorization, "
+                 "Access-Control-Allow-Headers: Content-Type, Authorization, MCP-Protocol-Version, "
                  "X-CBM-Artifact-Original-Size, X-CBM-Artifact-Schema-Version, "
                  "X-CBM-Artifact-Commit\r\n");
     }
@@ -152,10 +147,77 @@ struct cbm_http_server {
     char bind_address[64];
     char bearer_token[256];
     bool require_auth;
+    char allowed_origins[1024];
+    cbm_mutex_t dispatch_mutex;
 };
 
 static bool request_authorized(const cbm_http_server_t *srv, const cbm_http_req_t *req) {
     return !srv->require_auth || bearer_token_matches(req->authorization, srv->bearer_token);
+}
+
+static bool origin_allowed(const cbm_http_server_t *srv, const char *origin) {
+    if (!origin[0])
+        return true;
+    const char *host = NULL;
+    if (strncmp(origin, "http://", 7) == 0)
+        host = origin + 7;
+    else if (strncmp(origin, "https://", 8) == 0)
+        host = origin + 8;
+    if (!host)
+        return false;
+
+    const char *local_hosts[] = {"localhost", "127.0.0.1"};
+    for (size_t i = 0; i < sizeof(local_hosts) / sizeof(local_hosts[0]); i++) {
+        size_t len = strlen(local_hosts[i]);
+        if (strncmp(host, local_hosts[i], len) != 0)
+            continue;
+        const char *port = host + len;
+        if (!*port)
+            return true;
+        if (*port++ != ':' || !*port)
+            continue;
+        unsigned int number = 0;
+        while (*port >= '0' && *port <= '9' && number <= 65535)
+            number = number * 10 + (unsigned int)(*port++ - '0');
+        if (!*port && number > 0 && number <= 65535)
+            return true;
+    }
+
+    const char *start = srv->allowed_origins;
+    while (*start) {
+        const char *end = strchr(start, ',');
+        if (!end)
+            end = start + strlen(start);
+        const char *trimmed = end;
+        while (start < trimmed && (*start == ' ' || *start == '\t'))
+            start++;
+        while (trimmed > start && (trimmed[-1] == ' ' || trimmed[-1] == '\t'))
+            trimmed--;
+        if ((size_t)(trimmed - start) == strlen(origin) &&
+            memcmp(start, origin, (size_t)(trimmed - start)) == 0)
+            return true;
+        start = *end ? end + 1 : end;
+    }
+    return false;
+}
+
+static int check_request_head(const cbm_http_req_t *req, size_t content_length, void *ctx) {
+    const cbm_http_server_t *srv = ctx;
+    if (!origin_allowed(srv, req->origin))
+        return 403;
+    bool options = strcmp(req->method, "OPTIONS") == 0;
+    if (!options && !request_authorized(srv, req))
+        return 401;
+    if (strcmp(req->path, "/mcp") == 0) {
+        if (req->protocol_version[0] &&
+            !cbm_mcp_protocol_version_supported(req->protocol_version))
+            return 400;
+        if (!options && strcmp(req->method, "POST") != 0)
+            return 405;
+    }
+    bool artifact = strcmp(req->method, "POST") == 0 &&
+                    cbm_http_path_match(req->path, "/api/artifact/*");
+    return content_length > (artifact ? CBM_HTTP_MAX_BODY : MAX_RPC_BODY_SIZE) ? 413 : 0;
 }
 
 /* ── Forward declarations for process-kill PID validation ──────── */
@@ -182,7 +244,7 @@ static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
         return false;
 
     /* Build headers with correct Content-Type for this asset */
-    char hdrs[512];
+    char hdrs[sizeof(g_cors) + 256];
     snprintf(hdrs, sizeof(hdrs),
              "%sContent-Type: %s\r\n"
              "Cache-Control: public, max-age=31536000, immutable\r\n",
@@ -1528,10 +1590,10 @@ static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_se
     char *response = cbm_mcp_server_handle(mcp, req->body);
 
     if (response) {
-        cbm_http_replyf(c, 200, g_cors_json, "%s", response);
+        cbm_http_reply_buf(c, 200, g_cors_json, response, strlen(response));
         free(response);
     } else {
-        cbm_http_replyf(c, 204, g_cors, "%s", "");
+        cbm_http_replyf(c, strcmp(req->path, "/mcp") == 0 ? 202 : 204, g_cors, "%s", "");
     }
 }
 
@@ -1549,13 +1611,6 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* OPTIONS preflight for CORS */
     if (strcmp(req->method, "OPTIONS") == 0) {
         cbm_http_replyf(c, 204, g_cors, "%s", "");
-        return;
-    }
-
-    if (!request_authorized(srv, req)) {
-        char auth_headers[640];
-        snprintf(auth_headers, sizeof(auth_headers), "WWW-Authenticate: Bearer\r\n%s", g_cors_json);
-        cbm_http_replyf(c, 401, auth_headers, "%s", "{\"error\":\"unauthorized\"}");
         return;
     }
 
@@ -1648,7 +1703,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     if (cbm_http_path_match(req->path, "/")) {
         const cbm_embedded_file_t *f = cbm_embedded_lookup("/index.html");
         if (f) {
-            char html_hdrs[512];
+            char html_hdrs[sizeof(g_cors) + 128];
             snprintf(html_hdrs, sizeof(html_hdrs),
                      "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n", g_cors);
             cbm_http_reply_buf(c, 200, html_hdrs, f->data, (size_t)f->size);
@@ -1671,8 +1726,10 @@ cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_a
                                                      const char *bearer_token) {
     const char *address = (bind_address && bind_address[0]) ? bind_address : "127.0.0.1";
     const char *token = bearer_token ? bearer_token : "";
+    const char *origins = getenv("CBM_HTTP_ALLOWED_ORIGINS");
     if (strlen(address) >= sizeof(((cbm_http_server_t *)0)->bind_address) ||
-        strlen(token) >= sizeof(((cbm_http_server_t *)0)->bearer_token)) {
+        strlen(token) + strlen("Bearer ") >= sizeof(((cbm_http_req_t *)0)->authorization) ||
+        (origins && strlen(origins) >= sizeof(((cbm_http_server_t *)0)->allowed_origins))) {
         return NULL;
     }
     if (!is_loopback_bind(address) && token[0] == '\0') {
@@ -1685,15 +1742,18 @@ cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_a
         return NULL;
 
     srv->port = port;
+    cbm_mutex_init(&srv->dispatch_mutex);
     snprintf(srv->bind_address, sizeof(srv->bind_address), "%s", address);
     snprintf(srv->bearer_token, sizeof(srv->bearer_token), "%s", token);
     srv->require_auth = token[0] != '\0';
+    snprintf(srv->allowed_origins, sizeof(srv->allowed_origins), "%s", origins ? origins : "");
     atomic_store(&srv->stop_flag, 0);
 
     /* Create a dedicated MCP server for HTTP (own SQLite connection) */
     srv->mcp = cbm_mcp_server_new(NULL);
     if (!srv->mcp) {
         cbm_log_error("ui.http.mcp_fail", "reason", "cannot create MCP instance");
+        cbm_mutex_destroy(&srv->dispatch_mutex);
         free(srv);
         return NULL;
     }
@@ -1705,6 +1765,7 @@ cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_a
         cbm_log_warn("ui.unavailable", "port", port_str, "reason", "in_use", "hint",
                      "use --port=N to override");
         cbm_mcp_server_free(srv->mcp);
+        cbm_mutex_destroy(&srv->dispatch_mutex);
         free(srv);
         return NULL;
     }
@@ -1730,6 +1791,7 @@ void cbm_http_server_free(cbm_http_server_t *srv) {
         return;
     cbm_httpd_close(srv->listener);
     cbm_mcp_server_free(srv->mcp);
+    cbm_mutex_destroy(&srv->dispatch_mutex);
     free(srv);
 }
 
@@ -1739,34 +1801,64 @@ void cbm_http_server_stop(cbm_http_server_t *srv) {
     }
 }
 
-void cbm_http_server_run(cbm_http_server_t *srv) {
-    if (!srv || !srv->listener_ok)
-        return;
-
+static void *http_worker(void *arg) {
+    cbm_http_server_t *srv = arg;
     while (!atomic_load(&srv->stop_flag)) {
         cbm_http_conn_t *conn = cbm_httpd_accept(srv->listener, 200);
-        if (!conn)
-            continue; /* timeout — re-check stop flag */
+        if (!conn) {
+            cbm_mutex_lock(&srv->dispatch_mutex);
+            cbm_mcp_server_evict_idle(srv->mcp, 60);
+            cbm_mutex_unlock(&srv->dispatch_mutex);
+            continue;
+        }
 
         uint64_t request_start_ms = cbm_now_ms();
-        cbm_http_req_t req;
-        int rc = cbm_httpd_read_request(conn, &req);
+        cbm_http_req_t req = {0};
+        int rc = cbm_httpd_read_request_checked(conn, &req, check_request_head, srv);
         if (rc == 0) {
-            dispatch_request(srv, conn, &req);
-            cbm_log_http_request("graph_ui", req.method, req.path, cbm_http_conn_status(conn),
-                                 (int64_t)(cbm_now_ms() - request_start_ms), req.body_len,
-                                 cbm_http_conn_response_bytes(conn));
+            cbm_http_conn_defer_response(conn);
+            /* ponytail: serialize graph work; independent query stores are needed
+             * only if profiling shows graph execution, rather than socket I/O, bottlenecks. */
+            cbm_mutex_lock(&srv->dispatch_mutex);
+            if (!atomic_load(&srv->stop_flag))
+                dispatch_request(srv, conn, &req);
+            cbm_mutex_unlock(&srv->dispatch_mutex);
+            size_t request_bytes = req.body_len;
             cbm_http_req_free(&req);
+            cbm_httpd_flush_response(conn);
+            cbm_log_http_request("graph_ui", req.method, req.path, cbm_http_conn_status(conn),
+                                 (int64_t)(cbm_now_ms() - request_start_ms), request_bytes,
+                                 cbm_http_conn_response_bytes(conn));
         } else if (rc > 0) {
             /* Parse/transport error with a known HTTP status (400/408/411/413/431).
              * No CORS reflection here — the request was never parsed. */
-            cbm_http_replyf(conn, rc, "", "bad request");
+            const char *headers = rc == 401 ? "WWW-Authenticate: Bearer\r\n" :
+                                  rc == 405 ? "Allow: POST, OPTIONS\r\n" : "";
+            cbm_http_replyf(conn, rc, headers, "bad request");
             cbm_log_http_request("graph_ui", "", "", cbm_http_conn_status(conn),
                                  (int64_t)(cbm_now_ms() - request_start_ms), 0,
                                  cbm_http_conn_response_bytes(conn));
         }
         cbm_httpd_conn_close(conn);
     }
+    return NULL;
+}
+
+void cbm_http_server_run(cbm_http_server_t *srv) {
+    if (!srv || !srv->listener_ok)
+        return;
+
+    /* Fixed capacity bounds concurrent body/response buffers and thread stacks. */
+    cbm_thread_t workers[3];
+    int count = 0;
+    while (count < (int)(sizeof(workers) / sizeof(workers[0]))) {
+        if (cbm_thread_create(&workers[count], 0, http_worker, srv) != 0)
+            break;
+        count++;
+    }
+    http_worker(srv);
+    for (int i = 0; i < count; i++)
+        cbm_thread_join(&workers[i]);
 }
 
 bool cbm_http_server_is_running(const cbm_http_server_t *srv) {
@@ -1781,4 +1873,9 @@ void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
     if (srv && srv->listener_ok) {
         cbm_httpd_set_recv_deadline_ms(srv->listener, ms);
     }
+}
+
+void cbm_http_server_set_send_deadline_ms(cbm_http_server_t *srv, int ms) {
+    if (srv && srv->listener_ok)
+        cbm_httpd_set_send_deadline_ms(srv->listener, ms);
 }

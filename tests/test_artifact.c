@@ -10,6 +10,7 @@
 #include "foundation/log.h"
 
 #include <sys/stat.h>
+#include <sqlite3.h>
 #include <stdio.h>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -231,6 +232,102 @@ TEST(artifact_import_missing) {
     PASS();
 }
 
+TEST(artifact_import_rejects_invalid_graph_and_preserves_cache) {
+    const char *mutations[] = {
+        "DROP TABLE nodes; DROP TABLE edges; DROP TABLE projects;"
+        "DROP TABLE file_hashes; DROP TABLE project_summaries; CREATE TABLE unrelated(value);",
+        "DELETE FROM projects;",
+        "INSERT INTO projects VALUES('other-proj', '2026-01-01', '/tmp/other');",
+        "DROP TABLE file_hashes;",
+        "ALTER TABLE nodes RENAME COLUMN start_line TO wrong_column;",
+        "UPDATE nodes SET project = 'other-proj';",
+        "UPDATE edges SET target_id = 999;",
+        NULL, /* A metadata project which differs from the database. */
+        NULL, /* A corrupt freelist, without breaking normal graph reads. */
+    };
+    for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); i++) {
+        setup_artifact_test();
+        create_test_db(g_db);
+        char incoming[1024];
+        snprintf(incoming, sizeof(incoming), "%s/incoming.db", g_tmpdir);
+        create_test_db(incoming);
+        if (mutations[i]) {
+            sqlite3 *raw = NULL;
+            ASSERT_EQ(sqlite3_open(incoming, &raw), SQLITE_OK);
+            ASSERT_EQ(sqlite3_exec(raw, mutations[i], NULL, NULL, NULL), SQLITE_OK);
+            ASSERT_EQ(sqlite3_close(raw), SQLITE_OK);
+        } else if (i == 8) {
+            FILE *fp = fopen(incoming, "r+b");
+            ASSERT_NOT_NULL(fp);
+            const unsigned char bad_freelist[] = {0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 1};
+            ASSERT_EQ(fseek(fp, 32, SEEK_SET), 0);
+            ASSERT_EQ(fwrite(bad_freelist, 1, sizeof(bad_freelist), fp), sizeof(bad_freelist));
+            ASSERT_EQ(fclose(fp), 0);
+        }
+        ASSERT_EQ(cbm_artifact_export(incoming, g_repo, i == 7 ? "other-proj" : "test-proj",
+                                       CBM_ARTIFACT_FAST), 0);
+
+        int rc = cbm_artifact_import(g_repo, g_db);
+        cbm_store_t *store = cbm_store_open_path_query(g_db);
+        int nodes = store ? cbm_store_count_nodes(store, "test-proj") : -1;
+        int edges = store ? cbm_store_count_edges(store, "test-proj") : -1;
+        cbm_node_t node = {0};
+        bool searchable = store && cbm_store_find_node_by_qn(store, "test-proj", "test-proj.foo",
+                                                            &node) == CBM_STORE_OK;
+        cbm_node_free_fields(&node);
+        cbm_store_close(store);
+        char staged[1024];
+        snprintf(staged, sizeof(staged), "%s.import_tmp", g_db);
+        struct stat st;
+        int staged_exists = stat(staged, &st);
+        cleanup_dir(g_tmpdir);
+        ASSERT_NEQ(rc, 0);
+        ASSERT_EQ(nodes, 2);
+        ASSERT_EQ(edges, 1);
+        ASSERT_TRUE(searchable);
+        ASSERT_NEQ(staged_exists, 0);
+    }
+    PASS();
+}
+
+TEST(artifact_import_rejects_invalid_metadata) {
+    const char *fields[] = {
+        "\"schema_version\": 0, \"project\": \"test-proj\"",
+        "\"schema_version\": \"1\", \"project\": \"test-proj\"",
+        "\"schema_version\": 4294967297, \"project\": \"test-proj\"",
+        "\"schema_version\": 1",
+        "\"schema_version\": 1, \"project\": \"\"",
+        "\"schema_version\": 1, \"project\": \"test-proj\\u0000alias\"",
+        "\"schema_version\": 1, \"project\": \"test-proj\"",
+        "\"schema_version\": 1, \"project\": \"test-proj\"",
+    };
+    setup_artifact_test();
+    create_test_db(g_db);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    struct stat st;
+    ASSERT_EQ(stat(g_db, &st), 0);
+    char metadata_path[1024];
+    snprintf(metadata_path, sizeof(metadata_path), "%s/.codebase-memory/artifact.json", g_repo);
+    int accepted = 0;
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        char metadata[1024];
+        /* Last cases cover int overflow and inaccurate decompressed size. */
+        long long size = i == 6 ? 2147483648LL : (long long)st.st_size + (i == 7);
+        snprintf(metadata, sizeof(metadata), "{%s, \"original_size\": %lld}", fields[i], size);
+        write_text_file(metadata_path, metadata);
+        if (cbm_artifact_import(g_repo, g_db) == 0) {
+            accepted++;
+        }
+    }
+    cbm_store_t *store = cbm_store_open_path_query(g_db);
+    int nodes = store ? cbm_store_count_nodes(store, "test-proj") : -1;
+    cbm_store_close(store);
+    cleanup_dir(g_tmpdir);
+    ASSERT_EQ(accepted, 0);
+    ASSERT_EQ(nodes, 2);
+    PASS();
+}
+
 TEST(artifact_gitattributes_created) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -325,6 +422,8 @@ SUITE(artifact) {
     RUN_TEST(artifact_commit_hash);
     RUN_TEST(artifact_schema_version_mismatch);
     RUN_TEST(artifact_import_missing);
+    RUN_TEST(artifact_import_rejects_invalid_graph_and_preserves_cache);
+    RUN_TEST(artifact_import_rejects_invalid_metadata);
     RUN_TEST(artifact_gitattributes_created);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
