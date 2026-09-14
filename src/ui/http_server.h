@@ -12,6 +12,8 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "ui/httpd.h"
+#include "foundation/sha256.h"
 
 typedef struct cbm_http_server cbm_http_server_t;
 
@@ -26,7 +28,7 @@ cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_a
                                                      const char *bearer_token);
 
 /* Free the HTTP server (call after thread has been joined). */
-void cbm_http_server_free(cbm_http_server_t *srv);
+bool cbm_http_server_free(cbm_http_server_t *srv);
 
 /* Signal the HTTP server to stop (safe to call from any thread). */
 void cbm_http_server_stop(cbm_http_server_t *srv);
@@ -34,6 +36,18 @@ void cbm_http_server_stop(cbm_http_server_t *srv);
 /* Run four bounded I/O workers with serialized graph dispatch. Blocks until
  * stop is requested and all worker threads have joined. */
 void cbm_http_server_run(cbm_http_server_t *srv);
+bool cbm_http_server_schedule_run(cbm_http_server_t *srv);
+bool cbm_http_server_cancel_scheduled_run(cbm_http_server_t *srv);
+cbm_httpd_activity_t cbm_http_server_activity_for_test(cbm_http_server_t *srv);
+struct cbm_watcher;
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
+typedef int (*cbm_http_index_executor_fn)(void *, const char *, const char *);
+void cbm_http_server_set_index_executor(cbm_http_server_t *, cbm_http_index_executor_fn, void *);
+typedef bool (*cbm_http_project_mutation_begin_fn)(void *, const char *);
+typedef void (*cbm_http_project_mutation_end_fn)(void *, const char *);
+void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *, cbm_http_project_mutation_begin_fn,
+                                                cbm_http_project_mutation_end_fn, void *);
+void cbm_http_server_set_readiness_secret(cbm_http_server_t *, const uint8_t secret[CBM_SHA256_DIGEST_LEN]);
 
 /* Check if the server started successfully (listener bound). */
 bool cbm_http_server_is_running(const cbm_http_server_t *srv);
@@ -56,5 +70,8 @@ void cbm_http_server_set_binary_path(const char *path);
 
 /* Resolve argv[0] into an executable path suitable for subprocess spawning. */
 bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz);
+
+char *cbm_ui_git_web_base(const char *url);
+char *cbm_ui_git_strip_credentials(const char *url);
 
 #endif /* CBM_UI_HTTP_SERVER_H */

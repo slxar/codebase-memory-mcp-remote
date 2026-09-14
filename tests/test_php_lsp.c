@@ -17,6 +17,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "lsp/php_lsp.h"
 #include <string.h>
 
@@ -539,6 +540,87 @@ TEST(phplsp_trait_method_flattened) {
     ASSERT(r);
     ASSERT(require_resolved(r, "C.run", "C.shared") >= 0 ||
            require_resolved(r, "C.run", "T.shared") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 23b. Regression: a trait that uses itself must terminate ─────
+ *
+ * `trait T { use T; ... }` — directly, or via an alias that resolves back
+ * to T by short name (`use Other\T as A; use A;`) — previously sent
+ * flatten_trait_into_class() into an unbounded loop: each copied method
+ * re-matched the loop filter while cbm_registry_add_func() grew the
+ * registry, exhausting all memory (40 GB+, freezing the host). The fix
+ * short-circuits self-flattening and snapshots the loop bound. The
+ * assertion is simply that extraction returns: pre-fix this never
+ * completed, and under the ASan test build a regression would surface as
+ * an OOM/abort here rather than a silent hang. */
+TEST(phplsp_trait_self_use_terminates) {
+    const char *src =
+        "<?php\n"
+        "namespace App;\n"
+        "trait EnumTrait {\n"
+        "    use EnumTrait;\n"
+        "    public function getRandom(): int { return 1; }\n"
+        "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 23c. Regression #765: trait name collides with an aliased import ──
+ *
+ * `use Vendor\Pkg\Auditable as AuditableBase;` + `trait Auditable { use
+ * AuditableBase; ... }` — the composed alias canonicalizes (via short-name
+ * fallback) onto the ENCLOSING trait itself, which is the same
+ * self-flattening loop as 23b arriving through the import alias: each
+ * copied method re-matched the flatten filter while the registry grew,
+ * OOM-ing the indexer (reported at 40+ GB). Guarded by the #920 pair
+ * (self-flatten short-circuit + snapshotted loop bound); this fixture is
+ * the exact reproducer from issue #765 and hung/OOM'd before those. */
+TEST(phplsp_trait_aliased_import_name_collision_terminates) {
+    const char *src = "<?php\n"
+                      "namespace App\\Demo;\n"
+                      "\n"
+                      "use Vendor\\Pkg\\Auditable as AuditableBase;\n"
+                      "\n"
+                      "trait Auditable {\n"
+                      "    use AuditableBase;\n"
+                      "\n"
+                      "    function f() { $x = 1; return $x; }\n"
+                      "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 23d. Regression #951: class shares its short name with an aliased
+ * trait import ──
+ *
+ * `use App\Functions\Delivery as Delivery_Trait;` + `class Delivery { use
+ * Delivery_Trait; ... }` — resolving the composed alias falls back to the
+ * short name and lands on the LOCAL CLASS `Delivery`, so the class is
+ * flattened into itself (class_qn == canonical target QN): the same loop
+ * as 23b/23c reached through a class/trait short-name collision. Reported
+ * as an indexer OOM kill (exit 137) in issue #951. The two-file original
+ * reduces to this single-file form because the trait's definition being
+ * unavailable is exactly what forces the short-name fallback. */
+TEST(phplsp_class_aliased_trait_name_collision_terminates) {
+    const char *src = "<?php\n"
+                      "namespace App\\Modules\\Foo;\n"
+                      "\n"
+                      "use App\\Functions\\Delivery as Delivery_Trait;\n"
+                      "\n"
+                      "class Delivery {\n"
+                      "    use Delivery_Trait;\n"
+                      "\n"
+                      "    public function run(): void {\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
     cbm_free_result(r);
     PASS();
 }
@@ -5132,6 +5214,100 @@ TEST(phplsp_realistic_eloquent_model) {
     PASS();
 }
 
+/* Same-leaf typed dispatch must preserve occurrence identity through the PHP
+ * semantic pass. Full parser-carrier spans and target-specific semantic spans
+ * keep the two render calls from both joining the first resolved target. */
+TEST(phplsp_ordinary_same_leaf_calls_join_by_exact_site) {
+    static const char source[] = "<?php\n"
+                                 "class Alpha { public function render(): void {} }\n"
+                                 "class Beta { public function render(): void {} }\n"
+                                 "class OccurrenceProbe {\n"
+                                 "    public function run(Alpha $alpha, Beta $beta): void {\n"
+                                 "        $alpha->render();\n"
+                                 "        $beta->render();\n"
+                                 "    }\n"
+                                 "}\n";
+    static const char alpha_text[] = "$alpha->render()";
+    static const char beta_text[] = "$beta->render()";
+
+    const char *alpha_site = strstr(source, alpha_text);
+    const char *beta_site = strstr(source, beta_text);
+    ASSERT_NOT_NULL(alpha_site);
+    ASSERT_NOT_NULL(beta_site);
+    const uint32_t alpha_start = (uint32_t)(alpha_site - source);
+    const uint32_t alpha_end = alpha_start + (uint32_t)strlen(alpha_text);
+    const uint32_t beta_start = (uint32_t)(beta_site - source);
+    const uint32_t beta_end = beta_start + (uint32_t)strlen(beta_text);
+
+    CBMFileResult *r = extract_php(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *alpha_call = NULL;
+    const CBMCall *beta_call = NULL;
+    int render_carriers = 0;
+    int zero_span_carriers = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "OccurrenceProbe.run") ||
+            !call->callee_name || !strstr(call->callee_name, "render")) {
+            continue;
+        }
+        render_carriers++;
+        if (call->site_end_byte <= call->site_start_byte)
+            zero_span_carriers++;
+        if (call->site_start_byte == alpha_start && call->site_end_byte == alpha_end)
+            alpha_call = call;
+        if (call->site_start_byte == beta_start && call->site_end_byte == beta_end)
+            beta_call = call;
+    }
+
+    ASSERT_EQ(render_carriers, 2);
+    ASSERT_EQ(zero_span_carriers, 0);
+    ASSERT_NOT_NULL(alpha_call);
+    ASSERT_NOT_NULL(beta_call);
+    ASSERT_TRUE(alpha_call != beta_call);
+
+    const CBMResolvedCall *alpha_semantic = NULL;
+    const CBMResolvedCall *beta_semantic = NULL;
+    int render_semantics = 0;
+    int zero_span_hijackers = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || rc->confidence <= 0.0f || !rc->caller_qn ||
+            !strstr(rc->caller_qn, "OccurrenceProbe.run") || !rc->callee_qn ||
+            !strstr(rc->callee_qn, ".render")) {
+            continue;
+        }
+        render_semantics++;
+        if (rc->site_end_byte <= rc->site_start_byte)
+            zero_span_hijackers++;
+        if (strstr(rc->callee_qn, "Alpha.render") && rc->site_start_byte == alpha_start &&
+            rc->site_end_byte == alpha_end) {
+            alpha_semantic = rc;
+        }
+        if (strstr(rc->callee_qn, "Beta.render") && rc->site_start_byte == beta_start &&
+            rc->site_end_byte == beta_end) {
+            beta_semantic = rc;
+        }
+    }
+
+    ASSERT_EQ(render_semantics, 2);
+    ASSERT_EQ(zero_span_hijackers, 0);
+    ASSERT_NOT_NULL(alpha_semantic);
+    ASSERT_NOT_NULL(beta_semantic);
+    ASSERT_TRUE(alpha_semantic != beta_semantic);
+
+    const CBMResolvedCall *alpha_join =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, alpha_call, false);
+    const CBMResolvedCall *beta_join =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, beta_call, false);
+    ASSERT_TRUE(alpha_join == alpha_semantic);
+    ASSERT_TRUE(beta_join == beta_semantic);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(php_lsp) {
@@ -5160,6 +5336,9 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_phpdoc_property_class_tag);
     RUN_TEST(phplsp_phpdoc_method_class_tag);
     RUN_TEST(phplsp_trait_method_flattened);
+    RUN_TEST(phplsp_trait_self_use_terminates);
+    RUN_TEST(phplsp_trait_aliased_import_name_collision_terminates);
+    RUN_TEST(phplsp_class_aliased_trait_name_collision_terminates);
     RUN_TEST(phplsp_match_result_type);
     RUN_TEST(phplsp_ternary_result_type);
     RUN_TEST(phplsp_method_chain_depth_three);
@@ -5422,4 +5601,5 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_realistic_logger_chain_with_context);
     RUN_TEST(phplsp_realistic_carbon_chain_in_method);
     RUN_TEST(phplsp_realistic_eloquent_model);
+    RUN_TEST(phplsp_ordinary_same_leaf_calls_join_by_exact_site);
 }

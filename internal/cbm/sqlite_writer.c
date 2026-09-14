@@ -16,6 +16,7 @@
 
 #include "sqlite_writer.h"
 #include "foundation/constants.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 
@@ -25,6 +26,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#include <windows.h>
+#define cbm_writer_getpid _getpid
+#else
+#include <unistd.h>
+#define cbm_writer_getpid getpid
+#endif
 
 #define CBM_PAGE_SIZE 65536
 
@@ -502,8 +513,15 @@ static void pb_flush_leaf(PageBuilder *pb) {
         pb->leaf_cap = old_cap == 0 ? INITIAL_LEAF_CAP : old_cap * GROWTH_FACTOR;
         void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
         if (!tmp) {
+            /* Leave a CONSISTENT empty state: leaf_count stale at >=1 with a
+             * NULL leaves array walked pb_finalize_* straight into
+             * leaves[0] (null deref, clang-analyzer traced it) whenever the
+             * final cell block was already flushed. Empty state routes every
+             * finalize path to its existing root=0 failure return. */
             free(pb->leaves);
             pb->leaves = NULL;
+            pb->leaf_count = 0;
+            pb->leaf_cap = 0;
             return;
         }
         pb->leaves = (PageRef *)tmp;
@@ -738,7 +756,7 @@ static uint8_t *build_node_record(const CBMDumpNode *n, int *out_len) {
 }
 
 // Build an edges table record: (id, project, source_id, target_id, type, properties)
-// url_path_gen is a VIRTUAL generated column — NOT stored in the record.
+// url_path_gen and local_name_gen are VIRTUAL generated columns — NOT stored in the record.
 static uint8_t *build_edge_record(const CBMDumpEdge *e, int *out_len) {
     RecordBuilder r;
     rec_init(&r);
@@ -993,16 +1011,17 @@ static uint8_t *build_index_entry_text_int_text_rowid(const char *t1, int64_t va
     return cell;
 }
 
-// Build UNIQUE index entry for (text, text) + rowid (e.g., nodes unique(project, qualified_name))
-// Build UNIQUE index entry for (int64, int64, text) + rowid (edges unique(source_id, target_id,
-// type))
-static uint8_t *build_index_entry_unique_2int_text_rowid(int64_t v1, int64_t v2, const char *text,
-                                                         int64_t rowid, int *out_len) {
+// Build UNIQUE index entry for (int64, int64, text, text) + rowid — edges
+// unique(source_id, target_id, type, local_name_gen) (#768).
+static uint8_t *build_index_entry_unique_2int_2text_rowid(int64_t v1, int64_t v2, const char *text,
+                                                          const char *text2, int64_t rowid,
+                                                          int *out_len) {
     RecordBuilder r;
     rec_init(&r);
     rec_add_int(&r, v1);
     rec_add_int(&r, v2);
     rec_add_text(&r, text);
+    rec_add_text(&r, text2);
     rec_add_int(&r, rowid);
     int payload_len = 0;
     uint8_t *payload = rec_finalize(&r, &payload_len);
@@ -1038,8 +1057,11 @@ static bool pb_ensure_leaf_cap(PageBuilder *pb) {
     pb->leaf_cap = pb->leaf_cap == 0 ? INITIAL_LEAF_CAP : pb->leaf_cap * GROWTH_FACTOR;
     void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
     if (!tmp) {
+        /* Same consistent-empty contract as pb_flush_leaf's growth path. */
         free(pb->leaves);
         pb->leaves = NULL;
+        pb->leaf_count = 0;
+        pb->leaf_cap = 0;
         return false;
     }
     pb->leaves = (PageRef *)tmp;
@@ -1515,7 +1537,7 @@ static int cmp_edge_by_url_path(const void *a, const void *b) {
     return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
 }
 
-// autoindex_edges_1: UNIQUE(source_id, target_id, type) + rowid
+// autoindex_edges_1: UNIQUE(source_id, target_id, type, local_name_gen) + rowid (#768)
 static int cmp_edge_by_src_tgt_type(const void *a, const void *b) {
     int ia = *(const int *)a;
     int ib = *(const int *)b;
@@ -1528,6 +1550,10 @@ static int cmp_edge_by_src_tgt_type(const void *a, const void *b) {
         return c;
     }
     c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    if (c) {
+        return c;
+    }
+    c = strcmp(safe_str(g_sort_edges[ia].local_name), safe_str(g_sort_edges[ib].local_name));
     if (c) {
         return c;
     }
@@ -1567,8 +1593,8 @@ static uint8_t *ecell_proj_source_type(const CBMDumpEdge *e, int *out_len) {
     return build_index_entry_text_int_text_rowid(e->project, e->source_id, e->type, e->id, out_len);
 }
 static uint8_t *ecell_src_tgt_type(const CBMDumpEdge *e, int *out_len) {
-    return build_index_entry_unique_2int_text_rowid(e->source_id, e->target_id, e->type, e->id,
-                                                    out_len);
+    return build_index_entry_unique_2int_2text_rowid(e->source_id, e->target_id, e->type,
+                                                     safe_str(e->local_name), e->id, out_len);
 }
 static uint8_t *ecell_url_path(const CBMDumpEdge *e, int *out_len) {
     const char *url = (e->url_path && e->url_path[0] != '\0') ? e->url_path : NULL;
@@ -1701,6 +1727,8 @@ static uint32_t build_node_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpNo
 typedef struct {
     FILE *fp;
     uint32_t next_page;
+    char final_path[CBM_SZ_4K];
+    char temp_path[CBM_SZ_4K];
     const char *project;
     const char *root_path;
     const char *indexed_at;
@@ -1713,6 +1741,60 @@ typedef struct {
     CBMDumpTokenVec *token_vecs;
     int token_vec_count;
 } write_db_ctx_t;
+
+static int make_writer_temp_path(const char *path, const void *token, char *out, size_t out_size) {
+    int n = snprintf(out, out_size, "%s.tmp.%ld.%p", path, (long)cbm_writer_getpid(), token);
+    return (n >= 0 && (size_t)n < out_size) ? 0 : ERR_WRITE_FAILED;
+}
+
+static int sync_writer_output(FILE *fp) {
+    if (fflush(fp) != 0) {
+        return ERR_WRITE_FAILED;
+    }
+#ifdef _WIN32
+    return _commit(_fileno(fp)) == 0 ? 0 : ERR_WRITE_FAILED;
+#else
+    return fsync(fileno(fp)) == 0 ? 0 : ERR_WRITE_FAILED;
+#endif
+}
+
+static int discard_writer_output(write_db_ctx_t *w, int rc) {
+    if (w->fp) {
+        (void)fclose(w->fp);
+        w->fp = NULL;
+    }
+    if (w->temp_path[0]) {
+        (void)cbm_unlink(w->temp_path);
+    }
+    return rc;
+}
+
+static int publish_writer_output(write_db_ctx_t *w) {
+    if (sync_writer_output(w->fp) != 0) {
+        return discard_writer_output(w, ERR_WRITE_FAILED);
+    }
+    if (fclose(w->fp) != 0) {
+        w->fp = NULL;
+        if (w->temp_path[0]) {
+            (void)cbm_unlink(w->temp_path);
+        }
+        return ERR_WRITE_FAILED;
+    }
+    w->fp = NULL;
+    if (!w->temp_path[0] || !w->final_path[0]) {
+        return 0;
+    }
+    if (cbm_rename_replace(w->temp_path, w->final_path) != 0) {
+        (void)cbm_unlink(w->temp_path);
+        return ERR_WRITE_FAILED;
+    }
+    /* Sidecars are removed only after the replacement succeeds. On POSIX,
+     * readers of the old generation retain their unlinked handles. On
+     * Windows, an incompatible open handle makes MoveFileExW fail before
+     * this cleanup, preserving the old DB and its sidecars. */
+    cbm_remove_db_sidecars(w->final_path);
+    return 0;
+}
 
 /* Callback type for building a record from an item at index i. */
 typedef uint8_t *(*build_record_fn)(const void *items, int i, int *out_len);
@@ -1986,20 +2068,17 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     int rc =
         write_one_table(w, &edges_root, w->edges, w->edge_count, adapt_build_edge, adapt_edge_id);
     if (rc != 0) {
-        (void)fclose(fp);
-        return rc;
+        return discard_writer_output(w, rc);
     }
     rc = write_one_table(w, &vectors_root, w->vectors, w->vector_count, adapt_build_vector,
                          adapt_vector_id);
     if (rc != 0) {
-        (void)fclose(fp);
-        return rc;
+        return discard_writer_output(w, rc);
     }
     rc = write_one_table(w, &token_vecs_root, w->token_vecs, w->token_vec_count,
                          adapt_build_token_vec, adapt_token_vec_id);
     if (rc != 0) {
-        (void)fclose(fp);
-        return rc;
+        return discard_writer_output(w, rc);
     }
     CBM_PROF_END_N("write_db", "1_data_tables", t_data, node_count + edge_count);
 
@@ -2052,8 +2131,7 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
                                  &idx_nodes_name_root, &idx_nodes_file_root, &autoindex_nodes_root);
     CBM_PROF_END_N("write_db", "4_node_indexes_seq", t_node_idx, node_count * NODE_SORT_THREADS);
     if (nrc != 0) {
-        (void)fclose(fp);
-        return nrc;
+        return discard_writer_output(w, nrc);
     }
 
     CBM_PROF_START(t_edge_idx);
@@ -2070,8 +2148,7 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
                                  &idx_edges_url_path_root, &autoindex_edges_root);
     CBM_PROF_END_N("write_db", "5_edge_indexes_seq", t_edge_idx, edge_count * EDGE_SORT_THREADS);
     if (erc != 0) {
-        (void)fclose(fp);
-        return erc;
+        return discard_writer_output(w, erc);
     }
 
     // Autoindex for projects(name TEXT PK) — single text column
@@ -2135,13 +2212,20 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "CREATE INDEX idx_nodes_name ON nodes(project, name)"},
         {"index", "idx_nodes_file", "nodes", idx_nodes_file_root,
          "CREATE INDEX idx_nodes_file ON nodes(project, file_path)"},
+        // local_name_gen + widened UNIQUE (#768): must stay semantically
+        // identical to init_schema in src/store/store.c, and the hand-built
+        // sqlite_autoindex_edges_1 (cmp_edge_by_src_tgt_type +
+        // ecell_src_tgt_type) must produce exactly the values SQLite computes
+        // for local_name_gen, or integrity_check fails on the dumped DB.
         {"table", "edges", "edges", edges_root,
          "CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT "
          "NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL "
          "REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES "
          "nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT "
          "'{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS "
-         "(json_extract(properties,'$.url_path')),\n\t\tUNIQUE(source_id, target_id, type)\n\t)"},
+         "(json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS "
+         "(CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') "
+         "ELSE '' END),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen)\n\t)"},
         {"index", "sqlite_autoindex_edges_1", "edges", autoindex_edges_root, NULL},
         {"index", "idx_edges_source", "edges", idx_edges_source_root,
          "CREATE INDEX idx_edges_source ON edges(source_id, type)"},
@@ -2175,12 +2259,10 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     int master_count = sizeof(master) / sizeof(master[0]);
     int rc2 = write_master_page1(fp, master, master_count, next_page);
     if (rc2 != 0) {
-        (void)fclose(fp);
-        return rc2;
+        return discard_writer_output(w, rc2);
     }
     pad_file_to_page_boundary(fp, next_page);
-    (void)fclose(fp);
-    return 0;
+    return publish_writer_output(w);
 }
 
 // --- Streaming writer (incremental bulk node-table append) ---
@@ -2194,13 +2276,20 @@ struct cbm_db_writer {
 };
 
 cbm_db_writer_t *cbm_writer_open(const char *path) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        return NULL;
-    }
     cbm_db_writer_t *w = (cbm_db_writer_t *)calloc(CBM_ALLOC_ONE, sizeof(*w));
     if (!w) {
-        (void)fclose(fp);
+        return NULL;
+    }
+    int n = snprintf(w->wc.final_path, sizeof(w->wc.final_path), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(w->wc.final_path) ||
+        make_writer_temp_path(path, w, w->wc.temp_path, sizeof(w->wc.temp_path)) != 0) {
+        free(w);
+        return NULL;
+    }
+    FILE *fp = cbm_fopen(w->wc.temp_path, "wb");
+    if (!fp) {
+        (void)cbm_unlink(w->wc.temp_path);
+        free(w);
         return NULL;
     }
     w->wc.fp = fp;
@@ -2266,8 +2355,7 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     write_db_ctx_t wc = w->wc; /* value copy survives free(w) */
     free(w);
     if (err != 0) {
-        (void)fclose(wc.fp); /* wc is a value copy, valid after free(w) */
-        return err;
+        return discard_writer_output(&wc, err);
     }
     return write_db_after_nodes(&wc, nodes_root);
 }

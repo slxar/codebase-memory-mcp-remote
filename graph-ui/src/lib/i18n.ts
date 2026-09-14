@@ -17,11 +17,13 @@ export const messages = {
       saving: "Saving...",
       delete: "Delete",
       noMatches: "No matches",
+      dismiss: "Dismiss",
     },
     graph: {
       selectedLabel: "Graph",
       search: "Search...",
       clearSelection: "Clear selection",
+      folders: "Folders",
     },
     projects: {
       indexedProjects: "Indexed Projects",
@@ -37,14 +39,16 @@ export const messages = {
       healthCorrupt: "Database unhealthy",
       healthChecking: "Checking...",
       indexingInProgress: "Indexing in progress",
+      indexingFailed: "Indexing failed",
     },
     index: {
       newIndex: "New Index",
       selectRepositoryFolder: "Select Repository Folder",
       instructions: "Navigate to the project root and click \"Index This Folder\".",
       repositoryPath: "Repository path",
-      projectName: "Project name",
-      projectNamePlaceholder: "Optional display name",
+      projectName: "Project ID (optional — permanent, cannot be renamed)",
+      projectNamePlaceholder: "Derived from folder name if blank",
+      projectNameHelp: "Becomes the database name and query prefix. Leave blank to derive it from the path.",
       filterFolders: "Filter folders",
       noSubdirectories: "No subdirectories",
       indexThisFolder: "Index This Folder",
@@ -66,10 +70,8 @@ export const messages = {
       processLogs: "Process Logs",
       noProcesses: "No processes found",
       noLogs: "No logs yet",
-      kill: "Kill",
       thisProcess: "THIS",
       uptime: "Uptime",
-      killConfirm: (pid: number) => `Kill process ${pid}?`,
     },
   },
   zh: {
@@ -86,11 +88,13 @@ export const messages = {
       saving: "保存中...",
       delete: "删除",
       noMatches: "无匹配结果",
+      dismiss: "关闭",
     },
     graph: {
       selectedLabel: "图谱",
       search: "搜索...",
       clearSelection: "清除选择",
+      folders: "目录",
     },
     projects: {
       indexedProjects: "已索引项目",
@@ -106,14 +110,16 @@ export const messages = {
       healthCorrupt: "数据库异常",
       healthChecking: "检查中...",
       indexingInProgress: "正在索引",
+      indexingFailed: "索引失败",
     },
     index: {
       newIndex: "新建索引",
       selectRepositoryFolder: "选择仓库目录",
       instructions: "导航到项目根目录，然后点击“索引此目录”。",
       repositoryPath: "仓库路径",
-      projectName: "项目名称",
-      projectNamePlaceholder: "可选显示名称",
+      projectName: "项目 ID（可选，永久且不可重命名）",
+      projectNamePlaceholder: "留空则从路径派生",
+      projectNameHelp: "将作为数据库名称与查询前缀；留空则从路径派生。",
       filterFolders: "筛选目录",
       noSubdirectories: "没有子目录",
       indexThisFolder: "索引此目录",
@@ -135,10 +141,8 @@ export const messages = {
       processLogs: "进程日志",
       noProcesses: "未找到进程",
       noLogs: "暂无日志",
-      kill: "结束",
       thisProcess: "本进程",
       uptime: "运行时间",
-      killConfirm: (pid: number) => `结束进程 ${pid}？`,
     },
   },
 } as const;
@@ -148,8 +152,22 @@ export type UiMessages = (typeof messages)[UiLanguage];
 export function detectLanguage(acceptLanguage?: string | null, override?: string | null): UiLanguage {
   if (override === "zh" || override === "en") return override;
   if (!acceptLanguage) return "en";
-  const normalized = acceptLanguage.toLowerCase();
-  return normalized.includes("zh-cn") || normalized.includes("zh") ? "zh" : "en";
+
+  // Ranked by q, not by whether "zh" appears anywhere. A substring test served
+  // Chinese for "en-US,en;q=0.9,zh;q=0.5", where English is clearly preferred,
+  // and for "zh;q=0, en", where q=0 means Chinese is unacceptable.
+  const best = acceptLanguage
+    .split(",")
+    .map((part) => {
+      const [tag, ...params] = part.trim().split(";");
+      const q = params.map((p) => /^\s*q\s*=\s*([\d.]+)\s*$/i.exec(p)).find(Boolean);
+      return { tag: tag.trim().toLowerCase(), q: q ? Number(q[1]) : 1 };
+    })
+    .filter(({ tag, q }) => tag && Number.isFinite(q) && q > 0)
+    .sort((a, b) => b.q - a.q)
+    .find(({ tag }) => tag.split("-")[0] === "zh" || tag.split("-")[0] === "en");
+
+  return best?.tag.startsWith("zh") ? "zh" : "en";
 }
 
 let cachedLanguage: UiLanguage = "en";

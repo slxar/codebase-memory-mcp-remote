@@ -50,10 +50,15 @@ struct cbm_httpd {
     int port;
     atomic_int recv_deadline_ms;
     atomic_int send_deadline_ms;
+    atomic_int active_count;
+    atomic_int responding_count;
+    atomic_bool interrupted;
+    atomic_int send_buffer_for_test;
 };
 
 struct cbm_http_conn {
     cbm_sock_t fd;
+    cbm_httpd_t *owner;
     int recv_deadline_ms;
     int send_deadline_ms;
     int response_status;
@@ -208,6 +213,10 @@ cbm_httpd_t *cbm_httpd_listen_on(int port, const char *bind_address) {
     d->port = (int)ntohs(bound.sin_port);
     atomic_init(&d->recv_deadline_ms, CBM_HTTP_RECV_DEADLINE_MS);
     atomic_init(&d->send_deadline_ms, CBM_HTTP_SEND_DEADLINE_MS);
+    atomic_init(&d->active_count, 0);
+    atomic_init(&d->responding_count, 0);
+    atomic_init(&d->interrupted, false);
+    atomic_init(&d->send_buffer_for_test, 0);
     return d;
 }
 
@@ -229,17 +238,45 @@ void cbm_httpd_set_send_deadline_ms(cbm_httpd_t *d, int ms) {
         atomic_store(&d->send_deadline_ms, ms);
 }
 
-void cbm_httpd_close(cbm_httpd_t *d) {
+bool cbm_httpd_close(cbm_httpd_t *d) {
     if (!d)
-        return;
+        return true;
+    atomic_store(&d->interrupted, true);
     cbm_sock_close(d->fd);
+    if (atomic_load(&d->active_count) > 0)
+        return false;
     free(d);
+    return true;
+}
+
+void cbm_httpd_interrupt(cbm_httpd_t *d) {
+    if (d)
+        atomic_store(&d->interrupted, true);
+}
+
+cbm_httpd_activity_t cbm_httpd_activity_for_test(cbm_httpd_t *d) {
+    if (!d || atomic_load(&d->active_count) == 0)
+        return CBM_HTTPD_ACTIVITY_IDLE;
+    return atomic_load(&d->responding_count) > 0 ? CBM_HTTPD_ACTIVITY_RESPONDING
+                                                 : CBM_HTTPD_ACTIVITY_READING_REQUEST;
+}
+
+void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes) {
+    if (d)
+        atomic_store(&d->send_buffer_for_test, bytes);
+}
+
+void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms) {
+    if (d && ms > 0)
+        atomic_store(&d->send_deadline_ms, ms);
 }
 
 /* ── Accept ───────────────────────────────────────────────────── */
 
 cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     if (!d)
+        return NULL;
+    if (atomic_load(&d->interrupted))
         return NULL;
     if (wait_ready(d->fd, timeout_ms, false) != 1)
         return NULL;
@@ -257,6 +294,9 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
 #ifdef SO_NOSIGPIPE
     setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
+    int send_buffer = atomic_load(&d->send_buffer_for_test);
+    if (send_buffer > 0)
+        setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, (const char *)&send_buffer, sizeof(send_buffer));
 
     cbm_http_conn_t *c = calloc(1, sizeof(*c));
     if (!c) {
@@ -264,8 +304,10 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
         return NULL;
     }
     c->fd = cfd;
+    c->owner = d;
     c->recv_deadline_ms = atomic_load(&d->recv_deadline_ms);
     c->send_deadline_ms = atomic_load(&d->send_deadline_ms);
+    atomic_fetch_add(&d->active_count, 1);
     return c;
 }
 
@@ -273,6 +315,8 @@ void cbm_httpd_conn_close(cbm_http_conn_t *c) {
     if (!c)
         return;
     cbm_sock_close(c->fd);
+    if (c->owner)
+        atomic_fetch_sub(&c->owner->active_count, 1);
     free(c->pending_response);
     free(c);
 }
@@ -363,6 +407,7 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
     /* Exactly HTTP/1.0 or HTTP/1.1 */
     if (vlen != 8 || memcmp(version, "HTTP/1.", 7) != 0 || (version[7] != '0' && version[7] != '1'))
         return 400;
+    req->http_minor = (unsigned char)(version[7] - '0');
 
     size_t tlen = (size_t)(sp2 - target);
     if (tlen == 0 || target[0] != '/')
@@ -390,7 +435,8 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
 
     /* ── Header fields ── */
     bool have_content_length = false;
-    bool have_origin = false, have_authorization = false, have_protocol = false;
+    bool have_origin = false, have_host = false, have_content_type = false;
+    bool have_authorization = false, have_protocol = false;
     const char *p = line_end + 2;
     const char *head_stop = data + head_end - 2; /* start of final CRLF */
     while (p < head_stop) {
@@ -407,6 +453,15 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
                 req->origin[0] == '\0')
                 return 400;
             have_origin = true;
+        } else if (header_name_is(p, nlen, "host")) {
+            if (have_host || !copy_header_value(colon + 1, eol, req->host, sizeof(req->host)))
+                return 400;
+            have_host = true;
+        } else if (header_name_is(p, nlen, "content-type")) {
+            if (have_content_type ||
+                !copy_header_value(colon + 1, eol, req->content_type, sizeof(req->content_type)))
+                return 400;
+            have_content_type = true;
         } else if (header_name_is(p, nlen, "accept-language")) {
             copy_header_value(colon + 1, eol, req->accept_language, sizeof(req->accept_language));
         } else if (header_name_is(p, nlen, "authorization")) {
@@ -651,10 +706,12 @@ void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_header
         return;
     }
     int64_t deadline = now_ms() + c->send_deadline_ms;
-    if (send_all(c->fd, head, (size_t)hn, deadline) != 0)
-        return;
-    if (len > 0)
+    if (c->owner)
+        atomic_fetch_add(&c->owner->responding_count, 1);
+    if (send_all(c->fd, head, (size_t)hn, deadline) == 0 && len > 0)
         (void)send_all(c->fd, data, len, deadline);
+    if (c->owner)
+        atomic_fetch_sub(&c->owner->responding_count, 1);
 }
 
 void cbm_http_conn_defer_response(cbm_http_conn_t *c) {
@@ -664,8 +721,12 @@ void cbm_http_conn_defer_response(cbm_http_conn_t *c) {
 
 void cbm_httpd_flush_response(cbm_http_conn_t *c) {
     if (c && c->pending_response) {
+        if (c->owner)
+            atomic_fetch_add(&c->owner->responding_count, 1);
         (void)send_all(c->fd, c->pending_response, c->pending_len,
                        now_ms() + c->send_deadline_ms);
+        if (c->owner)
+            atomic_fetch_sub(&c->owner->responding_count, 1);
         free(c->pending_response);
         c->pending_response = NULL;
         c->pending_len = 0;

@@ -2,11 +2,11 @@
  * repro_main.c — Entry point for the cumulative BUG-REPRODUCTION suite.
  *
  * This runner is SEPARATE from the gating `make test` (test-runner). It exists
- * to hold reproduce-first cases for every OPEN bug issue. Each case asserts the
- * CORRECT behaviour, so it is **RED until the bug is fixed** — the redness is the
- * deliverable (proof the bug is real + the permanent regression guard).
+ * to hold reproduce-first cases for OPEN bugs plus the controls needed to prove
+ * their fixtures and oracles are meaningful. Reproduction cases assert the
+ * correct behaviour and stay RED until fixed; controls remain GREEN.
  *
- * Because these cases are red by design, they MUST NOT live in `ALL_TEST_SRCS`
+ * Because open reproductions are red by design, these suites MUST NOT live in `ALL_TEST_SRCS`
  * (that would turn the PR gate `ci-ok` red and wedge every merge). They are built
  * + run only via `make test-repro` and the `bug-repro.yml` workflow, neither of
  * which gates branch protection.
@@ -26,32 +26,42 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "repro_runner.h"
+#include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
 
 /* Per-suite summary + filter. RUN_SUITE prints a one-line
  * "[SUITE] <name> P passed, F failed" report (greppable for which suites still
- * have reds). When CBM_REPRO_ONLY is set (comma/space list of suite-name
- * substrings), only matching suites run — for fast targeted validation of a
- * single fix without rebuilding intent. */
-static int cbm_suite_enabled(const char *name) {
-    const char *only = getenv("CBM_REPRO_ONLY");
-    if (!only || !*only)
-        return 1;
-    return strstr(only, name) != NULL;
-}
+ * have reds). The shared selector implementation lives with its gating tests in
+ * repro_runner_filter.c. */
 #undef RUN_SUITE
-#define RUN_SUITE(name)                                                                  \
-    do {                                                                                 \
-        if (!cbm_suite_enabled(#name))                                                   \
-            break;                                                                       \
-        int _p0 = tf_pass_count, _f0 = tf_fail_count;                                    \
-        printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset());                       \
-        suite_##name();                                                                  \
-        printf("[SUITE] %-38s %d passed, %d failed\n", #name, tf_pass_count - _p0,       \
-               tf_fail_count - _f0);                                                     \
+#define RUN_SUITE(name)                                                            \
+    do {                                                                           \
+        if (!cbm_suite_enabled(#name))                                             \
+            break;                                                                 \
+        int _p0 = tf_pass_count, _f0 = tf_fail_count;                              \
+        printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset());                 \
+        suite_##name();                                                            \
+        printf("[SUITE] %-38s %d passed, %d failed\n", #name, tf_pass_count - _p0, \
+               tf_fail_count - _f0);                                               \
     } while (0)
 
 /* ── Repro suites (one per bug cluster / issue) ─────────────────── */
 extern void suite_repro_extraction(void);
+extern void suite_repro_runner_filter(void);
+extern void suite_repro_harness_cleanup(void);
+extern void suite_repro_language_registry(void);
+extern void suite_repro_call_node_manifest(void);
+extern void suite_repro_call_scope_usages(void);
+extern void suite_repro_call_argument_usages(void);
+extern void suite_repro_lsp_ordered_signatures(void);
+extern void suite_repro_lsp_ordered_local(void);
+extern void suite_repro_ts_overload_return_chains(void);
+extern void suite_repro_reference_precision(void);
+extern void suite_repro_lexical_binding_precision(void);
+extern void suite_repro_call_argument_matrix_a(void);
+extern void suite_repro_call_argument_matrix_b(void);
+extern void suite_repro_call_node_behaviors(void);
+extern void suite_repro_parallel_determinism(void);
 extern void suite_repro_issue495(void);
 extern void suite_repro_issue521(void);
 extern void suite_repro_issue382(void);
@@ -78,6 +88,9 @@ extern void suite_repro_issue221(void);
 extern void suite_repro_issue548(void);
 extern void suite_repro_issue363(void);
 extern void suite_repro_issue581(void);
+extern void suite_repro_issue787(void);
+extern void suite_repro_issue842(void);
+extern void suite_repro_issue964(void);
 /* NEW bugs found by the discovery sweep */
 extern void suite_repro_new_ts_class_field_arrow(void);
 extern void suite_repro_new_py_tuple_unpack(void);
@@ -105,10 +118,19 @@ extern void suite_repro_grammar_misc(void);
 extern void suite_repro_lsp_c_cpp(void);
 extern void suite_repro_lsp_go_py(void);
 extern void suite_repro_lsp_ts(void);
+/* TS cross-file inherited-method resolution gap (post-#840 probe flip) */
+extern void suite_repro_ts_inherited_method(void);
 extern void suite_repro_lsp_java_cs(void);
 extern void suite_repro_lsp_kt_php_rust(void);
 
 int main(void) {
+    /* #845 belt-and-suspenders: this binary EMBEDS cbm_mcp_handle_tool and its
+     * main() IGNORES argv — spawned as `<self> cli --index-worker …` it would
+     * re-run EVERY repro suite recursively (the observed 11-min hangs). The
+     * supervisor gate already ignores unmarked hosts; pin the kill switch too.
+     * A test that exercises the supervisor must explicitly re-enable it. */
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
      * leak) before stdio flushes — keep every printed line so the summary and the
      * RED rows always reach the board even on an abnormal exit. */
@@ -118,11 +140,26 @@ int main(void) {
     printf("════════════════════════════════════════════════════════════\n");
     printf("  CUMULATIVE BUG-REPRODUCTION SUITE\n");
     printf("  RED rows are EXPECTED — each is an open bug reproduced.\n");
-    printf("  A row that PASSES means that bug appears FIXED → flip it\n");
-    printf("  into the gating suite and close the issue with the guard.\n");
+    printf("  PASS rows may be controls or candidate fixes. Verify each\n");
+    printf("  RED→GREEN transition before promotion or issue closure.\n");
     printf("════════════════════════════════════════════════════════════\n");
 
     RUN_SUITE(repro_extraction);
+    RUN_SUITE(repro_runner_filter);
+    RUN_SUITE(repro_harness_cleanup);
+    RUN_SUITE(repro_language_registry);
+    RUN_SUITE(repro_call_node_manifest);
+    RUN_SUITE(repro_call_scope_usages);
+    RUN_SUITE(repro_call_argument_usages);
+    RUN_SUITE(repro_lsp_ordered_signatures);
+    RUN_SUITE(repro_lsp_ordered_local);
+    RUN_SUITE(repro_ts_overload_return_chains);
+    RUN_SUITE(repro_reference_precision);
+    RUN_SUITE(repro_lexical_binding_precision);
+    RUN_SUITE(repro_call_argument_matrix_a);
+    RUN_SUITE(repro_call_argument_matrix_b);
+    RUN_SUITE(repro_call_node_behaviors);
+    RUN_SUITE(repro_parallel_determinism);
     RUN_SUITE(repro_issue495);
     RUN_SUITE(repro_issue521);
     RUN_SUITE(repro_issue382);
@@ -152,6 +189,9 @@ int main(void) {
     RUN_SUITE(repro_new_cypher_limit_zero);
     RUN_SUITE(repro_issue363);
     RUN_SUITE(repro_issue581);
+    RUN_SUITE(repro_issue787);
+    RUN_SUITE(repro_issue842);
+    RUN_SUITE(repro_issue964);
     RUN_SUITE(repro_invariant_calls);
     RUN_SUITE(repro_invariant_graph);
     RUN_SUITE(repro_invariant_breadth);
@@ -172,8 +212,14 @@ int main(void) {
     RUN_SUITE(repro_lsp_c_cpp);
     RUN_SUITE(repro_lsp_go_py);
     RUN_SUITE(repro_lsp_ts);
+    RUN_SUITE(repro_ts_inherited_method);
     RUN_SUITE(repro_lsp_java_cs);
     RUN_SUITE(repro_lsp_kt_php_rust);
+
+    if (tf_pass_count + tf_fail_count + tf_skip_count == 0) {
+        fprintf(stderr, "::error::bug-repro runner executed zero tests\n");
+        return 2;
+    }
 
     TEST_SUMMARY();
 }

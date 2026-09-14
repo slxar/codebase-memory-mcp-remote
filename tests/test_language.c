@@ -1,7 +1,7 @@
 /*
  * test_language.c — Tests for language detection (filename + extension).
  *
- * RED phase: These tests define the expected behavior for all 64 languages.
+ * RED phase: These tests define the expected behavior for registered languages.
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
@@ -956,6 +956,11 @@ TEST(lang_ext_move) {
     PASS();
 }
 
+TEST(lang_ext_mojo) {
+    ASSERT_EQ(cbm_language_for_extension(".mojo"), CBM_LANG_MOJO);
+    PASS();
+}
+
 TEST(lang_ext_squirrel) {
     ASSERT_EQ(cbm_language_for_extension(".nut"), CBM_LANG_SQUIRREL);
     PASS();
@@ -1271,6 +1276,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_ispc);
     RUN_TEST(lang_ext_cairo);
     RUN_TEST(lang_ext_move);
+    RUN_TEST(lang_ext_mojo);
     RUN_TEST(lang_ext_squirrel);
     RUN_TEST(lang_ext_func);
     RUN_TEST(lang_ext_rst);

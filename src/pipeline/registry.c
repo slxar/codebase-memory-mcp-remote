@@ -25,6 +25,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
+#include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
@@ -75,6 +76,11 @@ const char *cbm_confidence_band(double score) {
 typedef CBM_DYN_ARRAY(char *) qn_array_t;
 
 struct cbm_registry {
+    /* Interned label strings (<=~30 distinct labels; owned here, freed in
+     * _free). The exact map's VALUES point into this pool instead of one
+     * strdup per registered definition (~8.5M strdups on the kernel). */
+    char *label_pool[64];
+    int label_pool_n;
     /* exact: qualifiedName → label string (heap-owned copies) */
     CBMHashTable *exact;
 
@@ -423,6 +429,76 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
+/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
+ * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
+ * could not resolve the receiver type — type-resolved calls win via lsp_*
+ * strategies before the registry runs. Binding such a call to a project symbol
+ * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
+ * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
+ * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
+ * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
+ * default-drop) because the parallel resolver runs lsp_* strategies through the
+ * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
+ * + side-effect-free so the contract is unit-testable without a full pipeline. */
+bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
+    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+        return false;
+    }
+    /* Weak short-name strategies that actually reach the call-resolution guards:
+     * the registry's suffix_match / unique_name and the parallel field_type_hint.
+     * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
+     * is not wired into the sequential/parallel resolvers today, so it never
+     * reaches this helper, but naming it keeps a future wiring from silently
+     * reintroducing the noise. Everything else — same_module / import_map /
+     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
+     * lsp_* — is a receiver- or import-aware match and is KEPT. */
+    return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
+           strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
+static bool js_ts_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+}
+
+static const char *path_basename(const char *path) {
+    if (!path || !path[0]) {
+        return path;
+    }
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) {
+        slash = bslash;
+    }
+#endif
+    return slash ? slash + 1 : path;
+}
+
+bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
+                                              const char *strategy) {
+    /* Two same-named symbols in different languages: suffix_match picks one
+     * winner by import-distance and attaches every bare-name call to it
+     * (#725, Bash/Python main, JS/Python commit). unique_name is the
+     * candidates==1 case (#1572) and is not this guard. */
+    if (!strategy || strcmp(strategy, "suffix_match") != 0) {
+        return false;
+    }
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    return true;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -437,17 +513,15 @@ cbm_registry_t *cbm_registry_new(void) {
 
 static void free_label(const char *key, void *value, void *ud) {
     (void)ud;
+    (void)value; /* interned in the registry's label_pool */
     free((void *)key);
-    free(value);
 }
 
 static void free_qn_array(const char *key, void *value, void *ud) {
     (void)ud;
     qn_array_t *arr = value;
     if (arr) {
-        for (int i = 0; i < arr->count; i++) {
-            free(arr->items[i]);
-        }
+        /* items borrow the exact map's keys — freed there, not here */
         cbm_da_free(arr);
         free(arr);
     }
@@ -458,10 +532,14 @@ void cbm_registry_free(cbm_registry_t *r) {
     if (!r) {
         return;
     }
-    cbm_ht_foreach(r->exact, free_label, NULL);
-    cbm_ht_free(r->exact);
+    /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    cbm_ht_foreach(r->exact, free_label, NULL);
+    cbm_ht_free(r->exact);
+    for (int i = 0; i < r->label_pool_n; i++) {
+        free(r->label_pool[i]);
+    }
     free(r);
 }
 
@@ -479,8 +557,28 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         return;
     }
 
-    /* Store in exact map: QN → label */
-    cbm_ht_set(r->exact, strdup(qualified_name), strdup(label));
+    /* Intern the label (bounded set; linear scan is fine at this size). */
+    const char *interned = NULL;
+    for (int i = 0; i < r->label_pool_n; i++) {
+        if (strcmp(r->label_pool[i], label) == 0) {
+            interned = r->label_pool[i];
+            break;
+        }
+    }
+    if (!interned && r->label_pool_n < (int)(sizeof(r->label_pool) / sizeof(r->label_pool[0]))) {
+        r->label_pool[r->label_pool_n] = strdup(label);
+        interned = r->label_pool[r->label_pool_n];
+        r->label_pool_n++;
+    }
+    if (!interned) {
+        return; /* pool exhausted (cannot happen with sane label sets) */
+    }
+
+    /* Store in exact map: QN → interned label. The key is the registry's ONE
+     * owned copy of the QN; by_name below borrows it (same lifetime) instead
+     * of a second strdup — this pair of copies was ~280 MB on the kernel. */
+    cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
+    const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
@@ -490,7 +588,7 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
         cbm_ht_set(r->by_name, strdup(simple), arr);
     }
-    cbm_da_push(arr, strdup(qualified_name));
+    cbm_da_push(arr, (char *)owned_qn);
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -564,6 +662,21 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * function name and suffix is NULL, so the target QN must be
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
+    /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
+     * import called bare: `from m import f as g; g()` — #875/#979; Yui
+     * `import execute as bridge_execute`). With a suffix present
+     * (`imported.method()`), returning the bare base here would swallow
+     * the suffix and bind the call to the imported symbol's own node
+     * (a Variable/Class/module) instead of base.method — exactly the
+     * mis-resolution the comment above warns about. That regressed
+     * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
+     * degraded to edges onto the signal variables themselves). #1000 */
+    if (!suffix || !suffix[0]) {
+        const char *direct = cbm_ht_get_key(r->exact, resolved);
+        if (direct) {
+            return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+        }
+    }
     char candidate[CBM_SZ_512];
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
@@ -756,24 +869,11 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
-    if (!r || !callee_name) {
-        return empty_result();
-    }
-
-    /* Per-file cache: same callee_name in N call sites → 1 chain walk
-     * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
-        if (cached) {
-            return cached->res;
-        }
-    }
-
+/* The strategy chain shared by both public resolve variants (no caching here —
+ * cbm_registry_resolve owns the per-file cache). */
+static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -812,6 +912,41 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
     }
+    return res;
+}
+
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+
+    /* Per-file cache: same callee_name in N call sites → 1 chain walk
+     * + N-1 O(1) hash hits. module_qn is constant per file so the
+     * cache key only needs callee_name. */
+    if (_resolve_cache) {
+        resolve_cache_entry_t *cached =
+            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
+        if (cached) {
+            return cached->res;
+        }
+    }
+
+    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
+                                                  import_map_vals, import_map_count);
+
+    /* Data relations (Table/View) are lineage-only registry members: common
+     * table names (users, orders, config) collide with code identifiers across
+     * every language, so the DEFAULT resolve never returns them — a veto, not a
+     * re-route, so a name-collision does not fall through to a weaker strategy.
+     * Every consumer (CALLS/USAGE/READS/WRITES/THROWS/handlers/decorators,
+     * present and future) is thereby relation-safe by construction. The SQL
+     * lineage path opts in via cbm_registry_resolve_lineage. */
+    if (res.qualified_name && res.qualified_name[0] &&
+        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+        res = empty_result();
+    }
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
@@ -828,6 +963,21 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         }
     }
     return res;
+}
+
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+    /* Relation-permitting variant for SQL FROM/JOIN lineage usages ONLY.
+     * Deliberately uncached: the per-file cache is keyed by bare callee_name
+     * and stores the relation-vetoed answer of the default variant — sharing
+     * it would poison one variant with the other's semantics. SQL files hold
+     * few distinct relation refs, so the chain walk stays cheap. */
+    return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                  import_map_count);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

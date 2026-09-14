@@ -11,10 +11,12 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 /* tree-sitter runtime allocator hooks (ts_runtime/src/alloc.h, TS_PUBLIC) and
  * mimalloc (vendored) — for the #424 allocator-binding regression test. */
@@ -440,6 +442,77 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
 #endif
 }
 
+#if !defined(_WIN32)
+/* Child-side alarm handler: a clean exit on the deadline — never reached on
+ * a crash (SIGSEGV/SIGBUS terminate the child first and stay visible). */
+static void so_parse_alarm_exit(int sig) {
+    (void)sig;
+    _exit(0);
+}
+
+#endif
+
+/* Parse `content` with tree-sitter DIRECTLY in a forked child — bypassing
+ * cbm_extract_file's Perl pre-parse nesting guard — returning true if the child
+ * died by signal. This is the crash-isolating regression for the vendored GLR
+ * stack-merge recursion cap (CBM_TS_STACK_MERGE_MAX_DEPTH, ts_runtime/src/stack.c):
+ * the extract-level guard skips pathologically nested Perl before it reaches the
+ * parser, so only a direct parse exercises the cap. Windows runs in-process (a
+ * real crash aborts the runner — a visible failure), mirroring so_extract_crashes. */
+static bool so_parse_crashes(const char *content, CBMLanguage lang) {
+    const TSLanguage *ts_lang = cbm_ts_language(lang);
+    if (!ts_lang) {
+        return false;
+    }
+#if defined(_WIN32)
+    TSParser *parser = ts_parser_new();
+    if (parser) {
+        ts_parser_set_language(parser, ts_lang);
+        TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+        if (tree) {
+            ts_tree_delete(tree);
+        }
+        ts_parser_delete(parser);
+    }
+    return false;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+    if (pid == 0) {
+        /* Deterministic ceiling. Falsification data (2026-07-18, macOS
+         * ASan): with CBM_TS_STACK_MERGE_MAX_DEPTH deleted outright, this
+         * branch stayed GREEN both unbounded (220s full grind, no crash)
+         * and bounded — instrumentation shows the recursive merge path is
+         * never even entered here (max depth 0 through the whole window).
+         * The cap-regression DETECTION therefore lives in the Windows
+         * in-process branch above (real ~1 MB native stack, where #913
+         * manifested); this POSIX branch is a bounded no-crash smoke of
+         * the pathological parse, and grinding past 10s adds no signal
+         * (unbounded it wandered 2s-218s with machine state). A real
+         * SIGSEGV/SIGBUS still terminates the child by signal before the
+         * alarm handler can exit cleanly. */
+        signal(SIGALRM, so_parse_alarm_exit);
+        alarm(10);
+        TSParser *parser = ts_parser_new();
+        if (parser) {
+            ts_parser_set_language(parser, ts_lang);
+            TSTree *tree = ts_parser_parse_string(parser, NULL, content, (uint32_t)strlen(content));
+            if (tree) {
+                ts_tree_delete(tree);
+            }
+            ts_parser_delete(parser);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    return WIFSIGNALED(status);
+#endif
+}
+
 TEST(lsp_java_deep_nesting_no_crash) {
     /* Deeply nested call expressions — the same shape as the elasticsearch
      * crash (fast SIGSEGV under recursive java_resolve_calls_in_node frames;
@@ -487,6 +560,93 @@ TEST(lsp_cpp_deep_expression_no_crash) {
     PASS();
 }
 
+TEST(lsp_python_deep_expression_no_crash) {
+    /* Issue #720: a deeply parenthesized assignment RHS drives
+     * py_eval_expr_type into one native recursion frame per paren level
+     * via py_process_statement's RHS inference — a path NOT covered by
+     * the py_resolve_calls_in walk_depth cap (that guards the emit walk,
+     * not the binder's expression evaluation). Pre-guard this SIGSEGVs.
+     * PY_LSP_MAX_EVAL_DEPTH turns it into a graceful unknown. Depth
+     * mirrors lsp_java_deep_nesting_no_crash. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 2 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "def main():\n    value = ");
+    memset(p, '(', DEPTH);
+    p += DEPTH;
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "\n    return value\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PYTHON, "deep_expr.py"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_perl_deep_expression_no_crash) {
+    /* Deeply nested Perl call expressions f(f(f(...f(1)...))). Unlike the
+     * Java/C++ cases, the overflow here is NOT in the LSP walk — it is in
+     * tree-sitter's own GLR parser: stack_node_add_link (vendored
+     * ts_runtime/src/stack.c) recurses once per nesting level while merging the
+     * ambiguous parse-stack heads that Perl's `f(...)` grammar produces, blowing
+     * a small (1 MB Windows) stack during the parse, before any LSP walk runs.
+     * The CBM_PERL_MAX_PARSE_NESTING pre-parse guard in cbm_extract_file skips
+     * such input so it never reaches tree-sitter. See
+     * lsp_java_deep_nesting_no_crash on the depth choice. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PERL, "deep.pl"));
+    free(src);
+    PASS();
+}
+
+TEST(perl_glr_deep_parse_recursion_capped) {
+    /* Issue #913 — the proper fix for what lsp_perl_deep_expression_no_crash's
+     * pre-parse guard only works around. Parse deeply nested ambiguous Perl
+     * f(f(f(...f(1)...))) DIRECTLY (past the CBM_PERL_MAX_PARSE_NESTING guard,
+     * which would otherwise skip it). Perl's paren-optional call grammar makes
+     * each level ambiguous, so tree-sitter's GLR parser merges the ambiguous
+     * parse-stack heads recursively — stack_node_add_link in
+     * ts_runtime/src/stack.c, once per nesting level — overflowing the native
+     * stack (a ~1 MB Windows stack, and even an 8 MB POSIX stack at this depth)
+     * during the parse, before any extraction runs. The
+     * CBM_TS_STACK_MERGE_MAX_DEPTH cap stops merging past the bound: the
+     * ambiguity is left on the GLR stack instead of merged — a valid parse,
+     * never a wrong one — so the parse returns cleanly instead of crashing.
+     * Depth mirrors lsp_perl_deep_expression_no_crash. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_parse_crashes(src, CBM_LANG_PERL));
+    free(src);
+    PASS();
+}
+
 TEST(lsp_java_lambda_args_exceed_params_no_crash) {
     /* A call with MORE arguments than the resolved method's declared params:
      * bind_lambda_args indexed the NULL-terminated signature param_types array
@@ -516,11 +676,111 @@ TEST(lsp_ts_cyclic_types_no_crash) {
     PASS();
 }
 
+/* ─── Deeply-nested calls drive the per-language LSP resolve walkers into
+ * per-nesting-level native recursion. Unguarded, these SIGSEGV and take down
+ * the whole index. Each walker now has a walk_depth cap (CBM_LSP_MAX_WALK_DEPTH,
+ * env-overridable) that skips the too-deep subtree — graceful degradation.
+ * These mirror lsp_java_deep_nesting_no_crash: same fixture shape, one per
+ * previously-unguarded walker (py_resolve_calls_in, resolve_calls_in_node[go],
+ * php_resolve_calls_in_node, kt_resolve_calls_in_node). RED proof: run the
+ * suite with CBM_LSP_MAX_WALK_DEPTH set huge (disabling only these caps) and
+ * each of these four SIGSEGVs — proving the guard, not the fixture, is what
+ * keeps them green. ─── */
+
+TEST(lsp_python_deep_nesting_no_crash) {
+    /* py_resolve_calls_in recurses per nesting level; see the Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "def f(a):\n    return a\ndef g():\n    return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PYTHON, "deep.py"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_go_deep_nesting_no_crash) {
+    /* resolve_calls_in_node recurses per nesting level; see the Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "package p\nfunc f(a int) int { return a }\nfunc g() int { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), " }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_GO, "deep.go"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_php_deep_nesting_no_crash) {
+    /* php_resolve_calls_in_node recurses per nesting level; Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "<?php\nfunction f($a) { return $a; }\nfunction g() { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), "; }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PHP, "deep.php"));
+    free(src);
+    PASS();
+}
+
+TEST(lsp_kotlin_deep_nesting_no_crash) {
+    /* kt_resolve_calls_in_node recurses per nesting level; Java analog. */
+    const int DEPTH = 30000;
+    size_t sz = (size_t)DEPTH * 3 + 256;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    p += snprintf(p, sz, "fun f(a: Int): Int { return a }\nfun g(): Int { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *p++ = 'f';
+        *p++ = '(';
+    }
+    *p++ = '1';
+    memset(p, ')', DEPTH);
+    p += DEPTH;
+    snprintf(p, sz - (size_t)(p - src), " }\n");
+    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_KOTLIN, "deep.kt"));
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite registration
  * ═══════════════════════════════════════════════════════════════════ */
 
-SUITE(stack_overflow) {
+/* Split into three sub-suites so parallel/sharded runs are not serialized
+ * behind one ~4-minute suite (it was the wall-clock critical path: every
+ * other suite finished underneath it). Pure re-registration — the 20
+ * RUN_TEST entries are exactly the ones the single suite carried; the
+ * before/after test-count parity is asserted in the shard runner. */
+SUITE(stack_overflow_a) {
     cbm_init();
 
     RUN_TEST(ts_allocator_bound_to_mimalloc_issue424);
@@ -528,7 +788,27 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_java_deep_nesting_no_crash);
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
+    RUN_TEST(lsp_python_deep_expression_no_crash);
+    RUN_TEST(lsp_perl_deep_expression_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_b) {
+    cbm_init();
+
+    RUN_TEST(perl_glr_deep_parse_recursion_capped);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
+    RUN_TEST(lsp_python_deep_nesting_no_crash);
+    RUN_TEST(lsp_go_deep_nesting_no_crash);
+    RUN_TEST(lsp_php_deep_nesting_no_crash);
+    RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_c) {
+    cbm_init();
 
     RUN_TEST(js_calls_exceed_512);
     RUN_TEST(python_calls_exceed_512);

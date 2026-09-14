@@ -149,6 +149,7 @@ struct cbm_http_server {
     bool require_auth;
     char allowed_origins[1024];
     cbm_mutex_t dispatch_mutex;
+    atomic_bool run_scheduled;
 };
 
 static bool request_authorized(const cbm_http_server_t *srv, const cbm_http_req_t *req) {
@@ -729,13 +730,13 @@ static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     db_path_for_project(proj, db_path, sizeof(db_path));
 
     cbm_store_t *store = cbm_store_open_path(db_path);
-    yyjson_doc_free(doc);
     if (!store) {
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
     }
 
     int rc = cbm_store_adr_store(store, proj, content);
+    yyjson_doc_free(doc);
     cbm_store_close(store);
 
     if (rc == CBM_STORE_OK) {
@@ -1748,6 +1749,7 @@ cbm_http_server_t *cbm_http_server_new_with_options(int port, const char *bind_a
     srv->require_auth = token[0] != '\0';
     snprintf(srv->allowed_origins, sizeof(srv->allowed_origins), "%s", origins ? origins : "");
     atomic_store(&srv->stop_flag, 0);
+    atomic_init(&srv->run_scheduled, false);
 
     /* Create a dedicated MCP server for HTTP (own SQLite connection) */
     srv->mcp = cbm_mcp_server_new(NULL);
@@ -1786,18 +1788,111 @@ cbm_http_server_t *cbm_http_server_new(int port) {
     return cbm_http_server_new_with_options(port, "127.0.0.1", NULL);
 }
 
-void cbm_http_server_free(cbm_http_server_t *srv) {
+char *cbm_ui_git_strip_credentials(const char *url) {
+    if (!url) return NULL;
+    const char *sep = strstr(url, "://");
+    if (!sep) return strdup(url);
+    const char *authority = sep + 3;
+    const char *slash = strchr(authority, '/');
+    const char *at = strchr(authority, '@');
+    if (!at || (slash && at > slash)) return strdup(url);
+    size_t prefix = (size_t)(authority - url);
+    const char *rest = at + 1;
+    char *out = malloc(prefix + strlen(rest) + 1);
+    if (!out) return NULL;
+    memcpy(out, url, prefix);
+    memcpy(out + prefix, rest, strlen(rest) + 1);
+    return out;
+}
+
+char *cbm_ui_git_web_base(const char *url) {
+    if (!url || !url[0]) return NULL;
+    char host_path[1024] = {0};
+    if (strncmp(url, "git@", 4) == 0) {
+        const char *at = url + 4;
+        const char *colon = strchr(at, ':');
+        if (!colon) return NULL;
+        snprintf(host_path, sizeof(host_path), "%.*s/%s", (int)(colon - at), at, colon + 1);
+    } else {
+        const char *p = strstr(url, "://");
+        if (!p) return NULL;
+        p += 3;
+        const char *at = strchr(p, '@');
+        if (at) p = at + 1;
+        snprintf(host_path, sizeof(host_path), "%s", p);
+    }
+    size_t len = strlen(host_path);
+    if (len > 4 && strcmp(host_path + len - 4, ".git") == 0) host_path[len - 4] = '\0';
+    len = strlen(host_path);
+    if (len > 0 && host_path[len - 1] == '/') host_path[len - 1] = '\0';
+    char *out = malloc(strlen(host_path) + 9);
+    if (!out) return NULL;
+    snprintf(out, strlen(host_path) + 9, "https://%s", host_path);
+    return out;
+}
+
+bool cbm_http_server_free(cbm_http_server_t *srv) {
     if (!srv)
-        return;
-    cbm_httpd_close(srv->listener);
+        return true;
+    if (atomic_load(&srv->run_scheduled))
+        return false;
+    if (!cbm_httpd_close(srv->listener))
+        return false;
     cbm_mcp_server_free(srv->mcp);
     cbm_mutex_destroy(&srv->dispatch_mutex);
     free(srv);
+    return true;
+}
+
+bool cbm_http_server_schedule_run(cbm_http_server_t *srv) {
+    if (!srv || !srv->listener_ok)
+        return false;
+    bool expected = false;
+    return atomic_compare_exchange_strong(&srv->run_scheduled, &expected, true);
+}
+
+bool cbm_http_server_cancel_scheduled_run(cbm_http_server_t *srv) {
+    if (!srv)
+        return false;
+    bool expected = true;
+    return atomic_compare_exchange_strong(&srv->run_scheduled, &expected, false);
+}
+
+cbm_httpd_activity_t cbm_http_server_activity_for_test(cbm_http_server_t *srv) {
+    return srv ? cbm_httpd_activity_for_test(srv->listener) : CBM_HTTPD_ACTIVITY_IDLE;
+}
+
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher) {
+    (void)srv;
+    (void)watcher;
+}
+
+void cbm_http_server_set_index_executor(cbm_http_server_t *srv, cbm_http_index_executor_fn fn,
+                                        void *ctx) {
+    (void)srv;
+    (void)fn;
+    (void)ctx;
+}
+
+void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *srv,
+                                                cbm_http_project_mutation_begin_fn begin,
+                                                cbm_http_project_mutation_end_fn end, void *ctx) {
+    (void)srv;
+    (void)begin;
+    (void)end;
+    (void)ctx;
+}
+
+void cbm_http_server_set_readiness_secret(cbm_http_server_t *srv,
+                                          const uint8_t secret[CBM_SHA256_DIGEST_LEN]) {
+    (void)srv;
+    (void)secret;
 }
 
 void cbm_http_server_stop(cbm_http_server_t *srv) {
     if (srv) {
         atomic_store(&srv->stop_flag, 1);
+        cbm_httpd_interrupt(srv->listener);
     }
 }
 

@@ -24,6 +24,20 @@ typedef struct {
     const char *target_qn;   // e.g. "test.main.foo"
 } CBMDictLiteralEntry;
 
+// Memoization entry for py_eval_expr_type (issue #710). Keyed by the
+// tree-sitter node identity pointer (TSNode.id), which is unique per node
+// within one file's parse tree. NOT the start byte: every leftmost
+// descendant of a chained call expression shares the chain's start byte,
+// so byte-keyed entries would alias distinct nodes and silently corrupt
+// call resolution. `gen` snapshots the scope generation (see
+// py_scope_bind in py_lsp.c); entries from older generations are treated
+// as misses so scope rebinding can never serve a stale type.
+typedef struct {
+    const void *node_id;   // TSNode.id; NULL marks an empty slot
+    uint32_t gen;          // scope generation at insert time
+    const CBMType *result; // full-fidelity result, never NULL in a live entry
+} CBMPyTypeCacheEntry;
+
 // PyLSPContext holds state for one Python file's type evaluation.
 typedef struct {
     CBMArena *arena;
@@ -36,6 +50,7 @@ typedef struct {
     // Built from CBMFileResult.imports.
     const char **import_local_names;
     const char **import_module_qns;
+    unsigned char *import_kinds; // internal PyDirectImportKind, classified once from the AST
     int import_count;
 
     // Current function/class context for resolving `self`/`cls` and emitting
@@ -55,8 +70,9 @@ typedef struct {
     // appears in result->calls because a `subscript`/`binary_operator` is not
     // a `call` node, so the syntactic extractor produced no call. When this is
     // non-NULL, py_emit_dunder_call injects a matching synthetic CBMCall so the
-    // recovered dunder call becomes a real CALLS edge. NULL in the cross-file
-    // path (no result->calls available there). Mirrors RustLSPContext.syn_calls.
+    // recovered dunder call becomes a real CALLS edge. Cross-file callers use
+    // a separate arena-owned output and merge it into the file result after
+    // resolution. Mirrors RustLSPContext.syn_calls.
     CBMCallArray *syn_calls;
 
     // Lambda registry: simple linear list, looked up by name.
@@ -68,6 +84,44 @@ typedef struct {
     CBMDictLiteralEntry *dict_literals;
     int dict_literal_count;
     int dict_literal_cap;
+
+    // AST-walk recursion depth for py_resolve_calls_in (guards stack overflow on
+    // deeply-nested/cyclic files; see cbm_lsp_max_walk_depth). Zero via memset.
+    int walk_depth;
+
+    // py_eval_expr_type memoization + guards (issues #710/#720; mirrors
+    // c_eval_expr_type's guard design in c_lsp.c). All zero via memset —
+    // each file starts with a cold cache and a full budget.
+    CBMPyTypeCacheEntry *type_cache; // open addressing, linear probe, arena-allocated
+    int type_cache_count;            // occupied slots (kept < 75% of cap)
+    int type_cache_cap;              // power-of-two capacity
+    uint32_t type_cache_gen;         // bumped on every scope mutation (O(1) flush)
+    int eval_depth;                  // evaluator recursion depth (PY_LSP_MAX_EVAL_DEPTH)
+    int eval_steps;                  // per-file work budget used (PY_EVAL_MAX_STEPS_PER_FILE)
+    uint32_t eval_truncations;       // depth/budget cutoff count — gates memo inserts
+
+    // Sticky fail-closed guard for exact callable-value proof. If a required
+    // scope/name/overlay allocation fails, later semantic passes must leave
+    // the syntactic occurrence as ordinary USAGE instead of consulting stale
+    // bindings and fabricating CALL_REFERENCE/CALLS edges.
+    bool callable_value_proof_disabled;
+
+    // Per-file instance-field OVERLAY. When the Tier-2 registry is shared + sealed
+    // (registry->read_only), `self.x = ...` / PEP-526 field discoveries made during
+    // resolve are recorded HERE instead of mutating the shared registry (which would
+    // bypass the add_* seal, race the other resolve workers, and leave the shared
+    // entry pointing into this file's arena once it is freed). py_lookup_field
+    // consults this overlay alongside the shared base, so same-file attribute-chain
+    // resolution is preserved with zero shared mutation. Arena-allocated (per-file
+    // lifetime); holds no pointer into the shared registry, and the shared registry
+    // holds none into it. Mutable per-file registries keep the direct write.
+    struct {
+        const char *class_qn;
+        const char *field_name;
+        const CBMType *field_type;
+    } *field_overlay;
+    int field_overlay_count;
+    int field_overlay_cap;
 
     // Debug mode (CBM_LSP_DEBUG env, shared across all language LSPs).
     bool debug;
@@ -109,7 +163,7 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
                           const char **import_names, const char **import_qns, int import_count,
                           TSTree *cached_tree, // NULL = parse internally
-                          CBMResolvedCallArray *out);
+                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Tier 2: pre-built per-language registry (mirrors Go pilot).
  * Filters all_defs to Python entries, builds + finalizes once. */
@@ -120,7 +174,7 @@ void cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
                                         const char **import_names, const char **import_qns,
                                         int import_count, TSTree *cached_tree,
-                                        CBMResolvedCallArray *out);
+                                        CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 // --- Batch cross-file LSP ---
 

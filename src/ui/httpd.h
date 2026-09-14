@@ -41,6 +41,12 @@
 typedef struct cbm_httpd cbm_httpd_t;         /* listener */
 typedef struct cbm_http_conn cbm_http_conn_t; /* accepted connection */
 
+typedef enum {
+    CBM_HTTPD_ACTIVITY_IDLE = 0,
+    CBM_HTTPD_ACTIVITY_READING_REQUEST = 1,
+    CBM_HTTPD_ACTIVITY_RESPONDING = 2,
+} cbm_httpd_activity_t;
+
 /* A parsed request. `path` and `query` are raw (NOT percent-decoded).
  * `origin`, `accept_language`, and authentication/artifact headers are the
  * values consumed by the routing layer ("" when absent). `body` is
@@ -49,7 +55,10 @@ typedef struct {
     char method[16];
     char path[2048];
     char query[2048];
+    unsigned char http_minor;
     char origin[256];
+    char host[256];
+    char content_type[128];
     char accept_language[256];
     char authorization[256];
     char protocol_version[32];
@@ -77,7 +86,11 @@ int cbm_httpd_port(const cbm_httpd_t *d);
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms);
 void cbm_httpd_set_send_deadline_ms(cbm_httpd_t *d, int ms);
 
-void cbm_httpd_close(cbm_httpd_t *d);
+bool cbm_httpd_close(cbm_httpd_t *d);
+void cbm_httpd_interrupt(cbm_httpd_t *d);
+cbm_httpd_activity_t cbm_httpd_activity_for_test(cbm_httpd_t *d);
+void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes);
+void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms);
 
 /* ── Connection handling ──────────────────────────────────────── */
 

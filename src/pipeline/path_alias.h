@@ -55,6 +55,7 @@ typedef struct {
  * pick up the map of the nearest ancestor scope. */
 typedef struct {
     char *dir_prefix;
+    char *source_rel_path; /* selected config file (tsconfig beats jsconfig) */
     cbm_path_alias_map_t *map;
 } cbm_path_alias_scope_t;
 
@@ -72,6 +73,9 @@ typedef struct {
  * are found (also NULL on out-of-memory). Caller frees with
  * cbm_path_alias_collection_free. */
 cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path);
+cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
+                                                            char **excluded_dirs,
+                                                            int excluded_count);
 
 /* Free a collection produced by cbm_load_path_aliases. NULL-safe. */
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);

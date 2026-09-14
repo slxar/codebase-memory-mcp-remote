@@ -5,18 +5,31 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 
 #include <stdbool.h>
 #include <stddef.h> // NULL
+#include <stdint.h> // uint32_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> // strdup
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#endif
 
 /* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
 #define FQN_MAX_PATH_SEGS 254
 #define FQN_MAX_DIR_SEGS 255
+
+/* Max bytes for a derived project name. The name becomes a filename component
+ * ("<cache>/<name>.db" and sidecars ".db-wal"/".db.corrupt"), so it must stay
+ * under the filesystem's 255-byte component limit. 200 leaves headroom for the
+ * longest sidecar suffix. #571 hex-encodes each non-ASCII byte to 2 chars, so a
+ * deep CJK path can triple past 255 and make the DB file un-openable (#624). */
+#define FQN_MAX_NAME_LEN 200
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
@@ -104,7 +117,19 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 
     char *path = strdup(rel_path ? rel_path : "");
     cbm_normalize_path_sep(path);
-    strip_file_extension(path);
+    /* #1077/#964: File-node QNs (name=="__file__") must preserve the full
+     * filename so sibling files sharing a stem get DISTINCT nodes — e.g.
+     * .env / .env.local / .env.production (which all strip to ".env" and
+     * collide, so only one survives per directory), and a C/C++ header vs
+     * its same-stem .cpp. Extension stripping stays for MODULE/symbol QNs
+     * (name==NULL or a symbol): that stem unification is load-bearing for
+     * C/C++ declaration↔definition cross-file resolution. All 26 __file__
+     * QN sites route through here, so creation and every lookup stay
+     * consistent. */
+    bool is_file_qn = name && strcmp(name, "__file__") == 0;
+    if (!is_file_qn) {
+        strip_file_extension(path);
+    }
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
@@ -351,13 +376,65 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
     return result;
 }
 
+/* Bound a derived project name to FQN_MAX_NAME_LEN bytes so "<cache>/<name>.db"
+ * stays within the filesystem's 255-byte filename-component limit (#624). Names
+ * within the cap are returned UNCHANGED (no drift). Longer names keep their first
+ * (CAP-9) bytes and get a "-XXXXXXXX" FNV-1a hash of the FULL name appended, so
+ * two long paths that share a prefix but differ later still map to distinct
+ * names. The suffix ends in a hex digit, so the result stays validator-safe. */
+static char *fqn_bound_name_len(char *name) {
+    if (!name) {
+        return name;
+    }
+    size_t n = strlen(name);
+    if (n <= FQN_MAX_NAME_LEN) {
+        return name; /* within cap → unchanged, no drift */
+    }
+    uint32_t h = 2166136261u; /* FNV-1a offset basis over the FULL name */
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)name[i];
+        h *= 16777619u;
+    }
+    /* Keep first (CAP-9) bytes + "-" + 8 hex = CAP total. The buffer holds n+1
+     * bytes and n > CAP, so writing 9 chars + NUL at offset (CAP-9) fits. */
+    snprintf(name + (FQN_MAX_NAME_LEN - 9), 10, "-%08x", h);
+    return name;
+}
+
+static bool path_is_root_syntax(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    for (const char *p = path; *p; p++) {
+        if (*p != '/' && *p != '\\' && *p != ':') {
+            return false;
+        }
+    }
+    return true;
+}
+
 char *cbm_project_name_from_path(const char *abs_path) {
     if (!abs_path || !abs_path[0]) {
         return strdup("root");
     }
+    if (path_is_root_syntax(abs_path)) {
+        return strdup("root");
+    }
+
+    char real[CBM_SZ_4K];
+    const char *name_path = abs_path;
+    /* Wide-path canonicalization — the ANSI _access/_fullpath pair corrupted
+     * CJK paths on CJK-locale Windows (#973). */
+    if (cbm_canonical_path(abs_path, real, sizeof(real))) {
+        cbm_normalize_path_sep(real);
+        name_path = real;
+    }
 
     /* Work on mutable copy */
-    char *path = strdup(abs_path);
+    char *path = strdup(name_path);
+    if (!path) {
+        return NULL;
+    }
     size_t len = strlen(path);
 
     /* Normalize path separators */
@@ -433,5 +510,8 @@ char *cbm_project_name_from_path(const char *abs_path) {
 
     char *result = strdup(start);
     free(path);
+    if (result) {
+        result = fqn_bound_name_len(result); /* #624: cap filename-component length */
+    }
     return result;
 }
